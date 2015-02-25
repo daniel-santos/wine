@@ -459,6 +459,7 @@ void exit_thread( int status )
 void WINAPI RtlExitUserThread( ULONG status )
 {
     static void *prev_teb;
+    sigset_t sigset;
     TEB *teb;
 
     if (status)  /* send the exit code to the server (0 is already the default) */
@@ -472,7 +473,7 @@ void WINAPI RtlExitUserThread( ULONG status )
         SERVER_END_REQ;
     }
 
-    if (interlocked_xchg_add( &nb_threads, -1 ) <= 1)
+    if (interlocked_xchg_add( &nb_threads, 0 ) <= 1)
     {
         LdrShutdownProcess();
         signal_exit_process( status );
@@ -493,6 +494,11 @@ void WINAPI RtlExitUserThread( ULONG status )
             free_thread_data( teb );
         }
     }
+
+    sigemptyset( &sigset );
+    sigaddset( &sigset, SIGQUIT );
+    pthread_sigmask( SIG_BLOCK, &sigset, NULL );
+    if (interlocked_xchg_add( &nb_threads, -1 ) <= 1) _exit( status );
 
     signal_exit_thread( status );
 }
