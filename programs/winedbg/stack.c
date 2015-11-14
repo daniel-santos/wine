@@ -307,6 +307,11 @@ static void stack_print_addr_and_args(int nf)
                     im.ModuleName, (DWORD_PTR)(ihsf.InstructionOffset - im.BaseOfImage));
 }
 
+static int addr_is_nonzero(const ADDRESS64 *addr)
+{
+    return addr->Offset && (addr->Mode != AddrModeFlat || addr->Segment);
+}
+
 /******************************************************************
  *		backtrace
  *
@@ -322,12 +327,24 @@ static void backtrace(void)
          dbg_curr_thread->curr_frame < dbg_curr_thread->num_frames;
          dbg_curr_thread->curr_frame++)
     {
-        dbg_printf("%s%d ", 
-                   (cf == dbg_curr_thread->curr_frame ? "=>" : "  "),
-                   dbg_curr_thread->curr_frame);
-        stack_print_addr_and_args(dbg_curr_thread->curr_frame);
+        const unsigned nf     = dbg_curr_thread->curr_frame;
+        const ADDRESS64 *addr = &dbg_curr_thread->frames[nf].addr_frame;
+
+        /* suppress bogus clone() frames from repeating */
+        if (nf > 0
+            && !addr_is_nonzero(addr)
+            && !addr_is_nonzero(&dbg_curr_thread->frames[nf - 1u].addr_frame)
+            && !memcmp(&dbg_curr_thread->frames[nf].addr_pc,
+                       &dbg_curr_thread->frames[nf - 1u].addr_pc,
+                       sizeof(dbg_curr_thread->frames[nf].addr_pc)))
+        {
+            break;
+        }
+
+        dbg_printf("%s%2u ", (cf == nf ? "=>" : "  "), nf);
+        stack_print_addr_and_args(nf);
         dbg_printf(" (");
-        print_bare_address(&dbg_curr_thread->frames[dbg_curr_thread->curr_frame].addr_frame);
+        print_bare_address(addr);
         dbg_printf(")\n");
     }
     /* reset context to current stack frame */
