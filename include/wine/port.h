@@ -432,6 +432,31 @@ static inline int interlocked_xchg_add( int *dest, int incr )
     return ret;
 }
 
+/* returns the previous value of the specified bit */
+static inline int interlocked_test_and_set_bit( int *dest, int bit )
+{
+    /* TODO: which versions of gcc break on asm goto? */
+    __asm__ __volatile__ goto ( "lock; btsl %1, (%0)\n\t"
+                                "jc %l2\n\t"
+                                : : "r" (dest), "r" (bit) : "memory", "cc" : carry);
+    return 0;
+
+carry:
+    return 1;
+}
+
+/* returns the previous value of the specified bit */
+static inline int interlocked_test_and_reset_bit( int *dest, int bit )
+{
+    __asm__ __volatile__ goto ( "lock; btrl %1, (%0)\n\t"
+                                "jc %l2\n\t"
+                                : : "r" (dest), "r" (bit) : "memory", "cc" : carry);
+    return 0;
+
+carry:
+    return 1;
+}
+
 #ifdef __x86_64__
 static inline unsigned char interlocked_cmpxchg128( __int64 *dest, __int64 xchg_high,
                                                     __int64 xchg_low, __int64 *compare )
@@ -468,6 +493,8 @@ static inline int interlocked_xchg( int *dest, int val )
 #else
 extern int interlocked_cmpxchg( int *dest, int xchg, int compare );
 extern int interlocked_xchg_add( int *dest, int incr );
+extern int interlocked_test_and_set_bit( int *dest, int bit );
+extern int interlocked_test_and_reset_bit( int *dest, int bit );
 extern int interlocked_xchg( int *dest, int val );
 #endif
 
@@ -519,6 +546,8 @@ extern __int64 interlocked_cmpxchg64( __int64 *dest, __int64 xchg, __int64 compa
 #define interlocked_xchg        __WINE_NOT_PORTABLE(interlocked_xchg)
 #define interlocked_xchg_ptr    __WINE_NOT_PORTABLE(interlocked_xchg_ptr)
 #define interlocked_xchg_add    __WINE_NOT_PORTABLE(interlocked_xchg_add)
+#define interlocked_test_and_set_bit __WINE_NOT_PORTABLE(interlocked_test_and_set_bit)
+#define interlocked_test_and_reset_bit __WINE_NOT_PORTABLE(interlocked_test_and_reset_bit)
 #define lstat                   __WINE_NOT_PORTABLE(lstat)
 #define memcpy_unaligned        __WINE_NOT_PORTABLE(memcpy_unaligned)
 #undef memmove
