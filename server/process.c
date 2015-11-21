@@ -48,6 +48,7 @@
 #include "request.h"
 #include "user.h"
 #include "security.h"
+#include "process_group.h"
 
 /* process structure */
 
@@ -627,6 +628,7 @@ static void process_destroy( struct object *obj )
     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
 
     close_process_handles( process );
+    process_group_term( process );
     set_process_startup_state( process, STARTUP_ABORTED );
 
     if (process->job)

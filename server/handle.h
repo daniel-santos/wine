@@ -39,14 +39,21 @@ extern obj_handle_t alloc_handle( struct process *process, void *obj,
 extern obj_handle_t alloc_handle_no_access_check( struct process *process, void *ptr,
                                                   unsigned int access, unsigned int attr );
 extern unsigned int close_handle( struct process *process, obj_handle_t handle );
-extern struct object *get_handle_obj( struct process *process, obj_handle_t handle,
-                                      unsigned int access, const struct object_ops *ops );
+extern struct object *get_handle_polytype_obj( struct process *process, obj_handle_t handle,
+                                               unsigned int access,
+                                               const struct object_ops *const ops[],
+                                               size_t ops_size );
+extern struct hybrid_server_object *get_handle_hybrid_obj( struct process *process,
+                                                           obj_handle_t handle,
+                                                           unsigned int access );
+extern unsigned int count_handles( const struct object *obj, struct process *process, obj_handle_t exclude );
 extern unsigned int get_handle_access( struct process *process, obj_handle_t handle );
 extern obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, struct process *dst,
                                       unsigned int access, unsigned int attr, unsigned int options );
-extern obj_handle_t open_object( struct process *process, obj_handle_t parent, unsigned int access,
-                                 const struct object_ops *ops, const struct unicode_str *name,
-                                 unsigned int attr );
+extern obj_handle_t open_polytype_object( struct process *process, obj_handle_t parent,
+                                          unsigned int access, const struct object_ops *const ops[],
+                                          size_t ops_size, const struct unicode_str *name,
+                                          unsigned int attr, struct object **obj );
 extern obj_handle_t find_inherited_handle( struct process *process, const struct object_ops *ops );
 extern obj_handle_t enumerate_handles( struct process *process, const struct object_ops *ops,
                                        unsigned int *index );
@@ -54,5 +61,20 @@ extern void close_process_handles( struct process *process );
 extern struct handle_table *alloc_handle_table( struct process *process, int count );
 extern struct handle_table *copy_handle_table( struct process *process, struct process *parent );
 extern unsigned int get_handle_table_count( struct process *process);
+
+static inline obj_handle_t open_object( struct process *process, obj_handle_t parent,
+                                        unsigned int access, const struct object_ops *ops,
+                                        const struct unicode_str *name, unsigned int attr )
+{
+    const struct object_ops *ops_array[1] = {ops};
+    return open_polytype_object( process, parent, access, ops_array, 1, name, attr, NULL );
+}
+
+static inline struct object *get_handle_obj( struct process *process, obj_handle_t handle,
+                                             unsigned int access, const struct object_ops *ops )
+{
+    const struct object_ops *ops_array[1] = {ops};
+    return get_handle_polytype_obj( process, handle, access, ops_array, 1 );
+}
 
 #endif  /* __WINE_SERVER_HANDLE_H */

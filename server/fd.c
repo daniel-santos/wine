@@ -100,6 +100,7 @@
 #include "file.h"
 #include "handle.h"
 #include "process.h"
+#include "process_group.h"
 #include "request.h"
 
 #include "winternl.h"
@@ -2510,28 +2511,58 @@ DECL_HANDLER(write)
 /* get file descriptor to shared memory block */
 DECL_HANDLER(get_shared_memory)
 {
-    if (req->tid)
+    reply->shm_id = 0;
+    reply->size   = 0;
+    reply->offset = 0;
+
+    if (req->handle)
+    {
+        struct hybrid_server_object *hso;
+        struct shm_object_info info = shm_object_info_init( );
+
+        if (!(hso = get_handle_hybrid_obj( current->process, req->handle, 0 )))
+            return;
+
+        if (!process_group_get_new_release_old( hso, current->process, req->handle, &info,
+                                                req->release_old ))
+            send_client_fd( current->process, info.fd, 0 );
+
+        reply->shm_id = info.shm_id;
+        reply->size   = info.size;
+        reply->offset = info.offset;
+
+        process_group_check_sanity( hso );
+        release_object( hso );
+    }
+    else if (req->tid)
     {
         struct thread *thread = get_thread_from_id( req->tid );
+
         if (thread)
         {
             if (thread->shm_fd != -1 || allocate_shared_memory( &thread->shm_fd,
                 (void **)&thread->shm, sizeof(*thread->shm) ))
             {
                 send_client_fd( current->process, thread->shm_fd, 0 );
+                reply->size = get_page_size();
             }
-            else
-                set_error( STATUS_NOT_SUPPORTED );
             release_object( thread );
+            if (thread->shm_fd == -1)
+                goto not_supported;
         }
     }
     else
     {
-        if (shmglobal_fd != -1)
-            send_client_fd( current->process, shmglobal_fd, 0 );
-        else
-            set_error( STATUS_NOT_SUPPORTED );
+        if (shmglobal_fd == -1)
+            goto not_supported;
+        send_client_fd( current->process, shmglobal_fd, 0 );
+        reply->size = get_page_size();
     }
+
+    return;
+
+not_supported:
+    set_error( STATUS_NOT_SUPPORTED );
 }
 
 /* perform an ioctl on a file */

@@ -16,6 +16,7 @@ C_SRCS = \
 	file.c \
 	handle.c \
 	hook.c \
+	hybrid_object.c \
 	mach.c \
 	mailslot.c \
 	main.c \
@@ -24,6 +25,7 @@ C_SRCS = \
 	named_pipe.c \
 	object.c \
 	process.c \
+	process_group.c \
 	procfs.c \
 	ptrace.c \
 	queue.c \
@@ -32,6 +34,7 @@ C_SRCS = \
 	request.c \
 	semaphore.c \
 	serial.c \
+	shm_slab.c \
 	signal.c \
 	snapshot.c \
 	sock.c \
@@ -51,5 +54,6 @@ MANPAGES = \
 	wineserver.man.in
 
 EXTRALIBS = $(LDEXECFLAGS) -lwine $(POLL_LIBS) $(RT_LIBS)
+CFLAGS += -DWINESERVER=1
 
 INSTALL_LIB = $(PROGRAMS)

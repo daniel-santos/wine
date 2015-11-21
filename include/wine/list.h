@@ -135,6 +135,17 @@ static inline int list_empty( const struct list *list )
     return list->next == list;
 }
 
+/* check if an object is in the list */
+static inline int list_has( const struct list *list, const struct list *item )
+{
+    const struct list *i;
+    for (i = list->next; i != list; i = i->next)
+        if (i == item)
+            return 1;
+
+    return 0;
+}
+
 /* initialize a list */
 static inline void list_init( struct list *list )
 {
