@@ -257,8 +257,23 @@ extern int getopt_long_only (int ___argc, char *const *___argv,
 #endif  /* HAVE_GETOPT_LONG_ONLY */
 
 #ifndef HAVE_FFS
-int ffs( int x );
+extern int ffs( int x );
 #endif
+
+#ifndef HAVE_FFSL
+extern int ffsl(long int x);
+#endif
+
+/* FIXME: make this clean & portable */
+/* count trailing ones */
+static inline int ctol(long val)
+{
+#if defined(__GNUC__) && __GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4)
+    return __builtin_ctzl(~val);
+#else
+    return ffsl(~val) - 1;
+#endif
+}
 
 #ifndef HAVE_ISFINITE
 int isfinite(double x);
@@ -495,6 +510,7 @@ extern __int64 interlocked_cmpxchg64( __int64 *dest, __int64 xchg, __int64 compa
 #define __WINE_NOT_PORTABLE(func) func##_is_not_portable func##_is_not_portable
 
 #define ffs                     __WINE_NOT_PORTABLE(ffs)
+#define ffs64                   __WINE_NOT_PORTABLE(ffs64)
 #define fstatvfs                __WINE_NOT_PORTABLE(fstatvfs)
 #define getopt_long             __WINE_NOT_PORTABLE(getopt_long)
 #define getopt_long_only        __WINE_NOT_PORTABLE(getopt_long_only)
