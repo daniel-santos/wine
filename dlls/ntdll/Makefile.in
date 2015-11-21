@@ -19,6 +19,7 @@ C_SRCS = \
 	file.c \
 	handletable.c \
 	heap.c \
+	hybrid_object.c \
 	large_int.c \
 	loader.c \
 	loadorder.c \

@@ -512,7 +512,7 @@ done:
 BOOL WINAPI GetLastInputInfo(PLASTINPUTINFO plii)
 {
     BOOL ret;
-    shmglobal_t *shm = wine_get_shmglobal();
+    const volatile shmglobal_t *shm = wine_get_shmglobal();
 
     TRACE("%p\n", plii);
 

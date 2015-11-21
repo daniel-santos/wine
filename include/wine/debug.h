@@ -172,6 +172,7 @@ extern const char *wine_dbg_sprintf( const char *format, ... ) __WINE_PRINTF_ATT
 extern int wine_dbg_printf( const char *format, ... ) __WINE_PRINTF_ATTR(1,2);
 extern int wine_dbg_log( enum __wine_debug_class cls, struct __wine_debug_channel *ch, const char *func,
                          const char *format, ... ) __WINE_PRINTF_ATTR(4,5);
+extern void wine_dbg_gonnadie( void );
 
 static inline const char *wine_dbgstr_a( const char *s )
 {

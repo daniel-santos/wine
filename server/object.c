@@ -51,7 +51,10 @@ struct namespace
 
 
 #ifdef DEBUG_OBJECTS
-static struct list object_list = LIST_INIT(object_list);
+#ifndef SHM_SLAB_DEBUG_EXPENSIVE /* HACK: for shm_slab debugging.  */
+static
+#endif
+struct list object_list = LIST_INIT(object_list);
 static struct list static_object_list = LIST_INIT(static_object_list);
 
 void dump_objects(void)
@@ -299,19 +302,25 @@ failed:
     return NULL;
 }
 
-/* create an object as named child under the specified parent */
-void *create_named_object( struct object *parent, const struct object_ops *ops,
-                           const struct unicode_str *name, unsigned int attributes,
-                           const struct security_descriptor *sd )
+/* create an object as named child under the specified parent
+ *
+ * ops[0] is the requested concrete type.  */
+void *create_named_polytype_object( struct object *parent, const struct object_ops *const ops[],
+                                    size_t ops_size, const struct unicode_str *name,
+                                    unsigned int attributes, const struct security_descriptor *sd )
 {
     struct object *obj, *new_obj;
     struct unicode_str new_name;
+    int i;
 
     clear_error();
 
+    for (i = 1; i < ops_size; ++i)
+        assert( ops[i]->size <= ops[0]->size );
+
     if (!name || !name->len)
     {
-        if (!(new_obj = alloc_object( ops ))) return NULL;
+        if (!(new_obj = alloc_object( ops[0] ))) return NULL;
         if (sd && !default_set_sd( new_obj, sd, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
                                    DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION ))
         {
@@ -325,7 +334,13 @@ void *create_named_object( struct object *parent, const struct object_ops *ops,
 
     if (!new_name.len)
     {
-        if (attributes & OBJ_OPENIF && obj->ops == ops)
+        int ops_match;
+        for (i = 0; i < ops_size; ++i)
+            if (obj->ops == ops[i])
+                break;
+        ops_match = i != ops_size;
+
+        if (attributes & OBJ_OPENIF && ops_match)
             set_error( STATUS_OBJECT_NAME_EXISTS );
         else
         {
@@ -339,23 +354,34 @@ void *create_named_object( struct object *parent, const struct object_ops *ops,
         return obj;
     }
 
-    new_obj = create_object( obj, ops, &new_name, sd );
+    new_obj = create_object( obj, ops[0], &new_name, sd );
     release_object( obj );
     return new_obj;
 }
 
 /* open a object by name under the specified parent */
-void *open_named_object( struct object *parent, const struct object_ops *ops,
-                         const struct unicode_str *name, unsigned int attributes )
+void *open_named_polytype_object( struct object *parent, const struct object_ops *const ops[],
+                                  size_t ops_size, const struct unicode_str *name,
+                                  unsigned int attributes )
 {
     struct unicode_str name_left;
     struct object *obj;
+    int i;
+
+    for (i = 1; i < ops_size; ++i)
+        assert( ops[i]->size <= ops[0]->size );
 
     if ((obj = lookup_named_object( parent, name, attributes, &name_left )))
     {
+        int ops_match;
+        for (i = 0; i < ops_size; ++i)
+            if (obj->ops == ops[i])
+                break;
+        ops_match = i != ops_size;
+
         if (name_left.len) /* not fully parsed */
             set_error( STATUS_OBJECT_NAME_NOT_FOUND );
-        else if (ops && obj->ops != ops)
+        else if (ops_size && !ops_match)
             set_error( STATUS_OBJECT_TYPE_MISMATCH );
         else
             return obj;

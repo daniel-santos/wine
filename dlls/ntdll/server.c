@@ -84,6 +84,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(server);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
+WINE_DECLARE_DEBUG_CHANNEL(ntdllsync);
 
 /* Some versions of glibc don't define this */
 #ifndef SCM_RIGHTS
@@ -324,6 +325,38 @@ unsigned int wine_server_call( void *req_ptr )
     return ret;
 }
 
+/***********************************************************************
+ *           wine_server_post (NTDLL.@)
+ *
+ * Post a messages asynchronously to the server.
+ *
+ * PARAMS
+ *     req_ptr [I/O] Function dependent data
+ *
+ * RETURNS
+ *      SUCCESS: STATUS_SUCCESS
+ *
+ * NOTES
+ *     This function is like wine_server_call() except that the calling thread
+ *     does not block or receive a response.
+ */
+
+/* FIXME: make sure that it isn't possible for a thread to post a message and
+ * then exit -- and the server delete that thread data prior to processing the
+ * message attached to that thread */
+unsigned int wine_server_post( void *req_ptr )
+{
+    struct __server_request_info * const req = req_ptr;
+    sigset_t old_set;
+    unsigned int ret;
+
+    req->u.req.request_header.reply_size = SERVER_REQUEST_REPLY_SIZE_POST;
+
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
+    ret = send_request( req );
+    pthread_sigmask( SIG_SETMASK, &old_set, NULL );
+    return ret;
+}
 
 /***********************************************************************
  *           server_enter_uninterrupted_section
@@ -583,23 +616,167 @@ static BOOL invoke_apc( const apc_call_t *call, apc_result_t *result )
     return user_apc;
 }
 
-
 /***********************************************************************
  *              server_select
  */
 unsigned int server_select( const select_op_t *select_op, data_size_t size, UINT flags,
                             const LARGE_INTEGER *timeout )
 {
-    unsigned int ret;
+    unsigned int i;
+    NTSTATUS ret = STATUS_SUCCESS;
+    NTSTATUS res;
     int cookie;
     BOOL user_apc = FALSE;
     obj_handle_t apc_handle = 0;
     apc_call_t call;
     apc_result_t result;
     timeout_t abs_timeout = timeout ? timeout->QuadPart : TIMEOUT_INFINITE;
+    size_t nb_handles = (size - offsetof( select_op_t, wait.handles ))
+                        / sizeof(select_op->wait.handles[0]);
+    ULONGLONG shared_objects = 0ull;
+    size_t nb_shared_objects = 0;
+    struct ntdll_object *objs[MAXIMUM_WAIT_OBJECTS];
 
     memset( &result, 0, sizeof(result) );
 
+    if (!select_op)
+        goto do_server_call;
+
+    /* Discover unique shared objects. */
+    for (i = 0; i < nb_handles; i++)
+    {
+        int j;
+        const ULONGLONG mask = 1ull << i;
+        HANDLE h = wine_server_ptr_handle( select_op->wait.handles[i] );
+        objs[i] = ntdll_handle_find( h );
+
+        if (!objs[i])
+            /* No ntdll_object */
+            continue;
+        else if (objs[i]->private)
+        {
+            /* Object is server-private. */
+release_object:
+            res = ntdll_object_release( objs[i] );
+            if (res)
+                ret = res;
+            objs[i] = NULL;
+            continue;
+        }
+
+        for (j = i; j;)
+            /* Check for both a duplicate handle and two handles to the same shared object via
+            * the value pointer, as we should never have the same memory mapped in two
+            * different places. */
+            if (objs[--j]->any.ho.atomic.value == objs[i]->any.ho.atomic.value)
+                goto release_object;
+
+        /* Object is shared and unique (or the first one) in the list. */
+        shared_objects |= mask;
+        ++nb_shared_objects;
+    }
+
+    /* Attempt a multi/single wait any or a single wait locally.  */
+
+    TRACE_(ntdllsync)("select_op = %p, size = %u, flags = 0x%x, timeout = %p (%lld)\n",
+                       select_op, size, flags, timeout, (timeout ? (long long)timeout->QuadPart : 0LL));
+
+    if (nb_shared_objects == 0)
+        goto do_server_call;
+    else if (select_op->op == SELECT_WAIT || (select_op->op == SELECT_WAIT_ALL && nb_handles == 1))
+    {
+        ssize_t i;
+        ssize_t wait_object = 0;
+        int do_server_call = 1;
+//fprintf(stderr, "%s: attempting local\n", __func__);
+        ret = STATUS_UNSUCCESSFUL;
+
+        TRACE_(ntdllsync)("%zd/%zd objects are shared, need %s.\n",
+                          nb_shared_objects, nb_handles,
+                          (select_op->op == SELECT_WAIT ? "any" : "all"));
+
+        /* with a single object, we call wait in-client */
+        if (nb_handles == 1 && nb_shared_objects)
+        {
+#if 0
+            /* TODO: make this work: with APCs and proper signal handling. */
+            if (!something->thread_has_apc)
+                ret = objs[0]->type->wait(objs[0], abs_timeout);
+            else
+#else
+            ret = objs[0]->type->trywait( objs[0] );
+#endif
+            goto local_done;
+        }
+
+        /* bWaitAll = FALSE */
+        /* If we did this right then this can't happen.  */
+        assert (select_op->op == SELECT_WAIT);
+
+        /* WaitForMultipleObjectsEx with bWaitAll = FALSE must go in order */
+        for (i = 0; i < nb_handles; ++i)
+        {
+            /* If we can't wait on this one locally, we must do the server call */
+            if (!objs[i])
+                break;
+
+            res = objs[i]->type->trywait(objs[i]);
+            if (res == STATUS_SUCCESS)
+            {
+                TRACE_(ntdllsync)("Successful local wait any. obj = %p (h = %p)\n", objs[i], objs[i]->h);
+
+                ret = STATUS_SUCCESS;
+                wait_object = i;
+                break;
+            }
+            else if (res == STATUS_WAS_LOCKED)
+                continue;
+            else
+                ret = res;
+        }
+
+local_done:
+        /* If ret is one of the below values then we return.  Otherwise we do a server call. */
+        switch (ret)
+        {
+        case STATUS_WAS_LOCKED:
+            if (abs_timeout == 0)
+            {
+                ret = STATUS_TIMEOUT;
+                do_server_call = 0;
+            }
+            break;
+
+        case STATUS_SUCCESS:
+            ret = WAIT_OBJECT_0 + wait_object;
+            /* intentional fall-through */
+
+        case WAIT_ABANDONED:
+        case WAIT_TIMEOUT:
+            do_server_call = 0;
+            break;
+        }
+
+        /* release any objects we've grabbed */
+        for (i = 0; i < nb_handles; ++i)
+        {
+            struct ntdll_object *obj;
+
+            if ((obj = objs[i]))
+            {
+                res = ntdll_object_release(obj);
+                if (!ret)
+                    ret = res;
+            }
+        }
+        if (!do_server_call)
+            return ret;
+    }
+
+    if (TRACE_ON(ntdllsync) && select_op && (select_op->op == SELECT_WAIT
+                                          || select_op->op == SELECT_WAIT_ALL))
+        TRACE_(ntdllsync)("Doing server call.\n");
+do_server_call:
     for (;;)
     {
         SERVER_START_REQ( select )
@@ -987,7 +1164,7 @@ done:
  *
  * Receive a file descriptor to a server shared memory block.
  */
-static int server_get_shared_memory_fd( HANDLE thread, int *unix_fd )
+static int server_get_shared_memory_fd( HANDLE thread, HANDLE obj, int *fd_ptr, struct shm_object_info *info )
 {
     obj_handle_t dummy;
     sigset_t sigset;
@@ -997,11 +1174,20 @@ static int server_get_shared_memory_fd( HANDLE thread, int *unix_fd )
 
     SERVER_START_REQ( get_shared_memory )
     {
-        req->tid = HandleToULong(thread);
+        req->tid    = HandleToULong(thread);
+        req->handle = HandleToULong(obj);
         if (!(ret = wine_server_call( req )))
         {
-            *unix_fd = receive_fd( &dummy );
-            if (*unix_fd == -1) ret = STATUS_NOT_SUPPORTED;
+            *fd_ptr = receive_fd( &dummy );
+            if (info)
+            {
+                info->flags  = 0;
+                info->shm_id = reply->shm_id;
+                info->offset = reply->offset;
+                info->size   = reply->size;
+                info->fd     = *fd_ptr;
+            }
+            if (*fd_ptr == -1) ret = STATUS_NOT_SUPPORTED;
         }
     }
     SERVER_END_REQ;
@@ -1031,37 +1217,98 @@ static inline BOOL experimental_SHARED_MEMORY( void )
  *
  * Get address of a shared memory block.
  */
-void *server_get_shared_memory( HANDLE thread )
+static NTSTATUS server_get_shared_memory( HANDLE thread, void **ptr_ptr )
 {
     static shmglobal_t *shmglobal = (void *)-1;
-    void *mem = NULL;
     int fd = -1;
+    NTSTATUS ret;
 
     if (!experimental_SHARED_MEMORY())
-        return NULL;
-
+    {
+        *ptr_ptr = NULL;
+        return STATUS_NOT_SUPPORTED;
+    }
     /* The global memory block is only requested once. No locking is
      * required because this function is called very early during the
      * process initialization for the first time. */
     if (!thread && shmglobal != (void *)-1)
-        return shmglobal;
+    {
+        *ptr_ptr = shmglobal;
+        return STATUS_SUCCESS;
+    }
 
-    if (!server_get_shared_memory_fd( thread, &fd ))
+    if (!(ret = server_get_shared_memory_fd( thread, NULL, &fd, NULL )))
     {
         SIZE_T size = thread ? sizeof(shmlocal_t) : sizeof(shmglobal_t);
-        virtual_map_shared_memory( fd, &mem, 0, &size, PAGE_READONLY );
+
+        virtual_map_shared_memory( fd, ptr_ptr, 0, &size, PAGE_READONLY );
         close( fd );
     }
+    else
+        ERR("server_get_shared_memory_fd failed with %08x\n", ret);
 
     if (!thread)
     {
-        if (mem) WARN_(winediag)("Using shared memory wineserver communication\n");
-        shmglobal = mem;
+        if (*ptr_ptr) WARN_(winediag)("Using shared memory wineserver communication\n");
+        shmglobal = *ptr_ptr;
     }
 
-    return mem;
+    return ret;
 }
 
+/***********************************************************************
+ *           server_get_object_shared_memory
+ *
+ * Get (new or updated) shared object memory from server.
+ *
+ * PARAMS
+ *     obj     [I]  Handle to the object
+ *     info    [IO] See below
+ *
+ * The input should populate info->shm_id with the unique id for the shared memory (provided by the
+ * server) if known. If info->shm_id is != 0 then the offset should also be supplied. The output
+ * will populate shm_id and offset if not known and will always populate info->ptr if the call
+ * succeeds.
+ *
+ * If failure occurs, info is not changed.
+ *
+ * TODO: consolidate with server_get_shared_memory?
+ */
+NTSTATUS server_get_object_shared_memory( HANDLE obj, struct shm_object_info *info )
+{
+    NTSTATUS ret;
+
+    if (!have_shm_sync())
+        return STATUS_NOT_SUPPORTED;
+
+    if (info->shm_id)
+    {
+        /* first see if this shm_id is already known and mapped */
+        info->fd = -1;
+        ret = virtual_get_shared_memory( NULL, info );
+
+        if (!ret)
+            goto done;
+
+        /* success or error returns, but if not found, we proceed */
+        if (ret != STATUS_NOT_FOUND)
+            return ret;
+    }
+
+    /* otherwise, request a local fd */
+    ret = server_get_shared_memory_fd( NULL, obj, &info->fd, info );
+    if (ret)
+        return ret;
+
+    ret = virtual_get_shared_memory( NULL, info );
+    close( info->fd );
+
+    if (ret)
+        return ret;
+
+done:
+    return STATUS_SUCCESS;
+}
 
 /***********************************************************************
  *           wine_server_fd_to_handle   (NTDLL.@)
@@ -1598,8 +1845,19 @@ size_t server_init_thread( void *entry_point, BOOL *suspend )
     SERVER_END_REQ;
 
     /* initialize thread shared memory pointers */
-    NtCurrentTeb()->Reserved5[1] = server_get_shared_memory( 0 );
-    NtCurrentTeb()->Reserved5[2] = server_get_shared_memory( NtCurrentTeb()->ClientId.UniqueThread );
+    if (!ret)
+    {
+        ret = server_get_shared_memory( 0, &NtCurrentTeb()->Reserved5[1] );
+        if (ret == STATUS_NOT_SUPPORTED)
+            ret = STATUS_SUCCESS;
+    }
+
+    if (!ret)
+    {
+        ret = server_get_shared_memory( NtCurrentTeb()->ClientId.UniqueThread, &NtCurrentTeb()->Reserved5[2] );
+        if (ret == STATUS_NOT_SUPPORTED)
+            ret = STATUS_SUCCESS;
+    }
 
     is_wow64 = !is_win64 && (server_cpus & ((1 << CPU_x86_64) | (1 << CPU_ARM64))) != 0;
     ntdll_get_thread_data()->wow64_redir = is_wow64;
@@ -1628,4 +1886,18 @@ size_t server_init_thread( void *entry_point, BOOL *suspend )
     default:
         server_protocol_error( "init_thread failed with status %x\n", ret );
     }
+}
+
+NTSTATUS server_wake( HANDLE obj )
+{
+    NTSTATUS ret;
+
+    SERVER_START_REQ( notify_signaled )
+    {
+        req->handle = HandleToULong( obj );
+        ret = wine_server_post( req );
+    }
+    SERVER_END_REQ;
+
+    return ret;
 }

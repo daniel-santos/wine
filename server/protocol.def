@@ -53,6 +53,8 @@ struct request_header
     data_size_t  reply_size;   /* reply variable part maximum size */
 };
 
+#define SERVER_REQUEST_REPLY_SIZE_POST  ((data_size_t)0x80000000)
+
 struct reply_header
 {
     unsigned int error;        /* error result */
@@ -74,6 +76,7 @@ typedef struct
 {
     unsigned int last_input_time;       /* last input time */
     unsigned int foreground_wnd_epoch;  /* counter to invalidate foreground window */
+    unsigned int last_server_cpu;       /* the last cpu the server ran on */
 } shmglobal_t;
 
 /* wineserver local shared memory block */
@@ -1164,8 +1167,14 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     VARARG(objattr,object_attributes); /* object attributes */
 @REPLY
     obj_handle_t handle;        /* handle to the semaphore */
+    unsigned int private;       /* true if object is server-private */
+    client_ptr_t shm_id;        /* unique id for the shared memory block */
+    unsigned int offset;        /* offset from start of shared memory to the object */
 @END
 
+/* (a slight hack) bit set in access mask for NTCreateSemaphore, et. al., to dictate a server-only object */
+#define SYNC_OBJECT_ACCESS_SERVER_ONLY    0x8000
+#define SYNC_OBJECT_ACCESS_MASK           (~SYNC_OBJECT_ACCESS_SERVER_ONLY)
 
 /* Release a semaphore */
 @REQ(release_semaphore)
@@ -1190,6 +1199,10 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     VARARG(name,unicode_str);   /* object name */
 @REPLY
     obj_handle_t handle;        /* handle to the semaphore */
+    unsigned int private;       /* true if object is server-private */
+    client_ptr_t shm_id;        /* unique id for the shared memory block */
+    unsigned int offset;        /* offset from start of shared memory to the object */
+    unsigned int max;           /* max value */
 @END
 
 
@@ -1274,7 +1287,13 @@ enum server_fd_type
 
 /* Get file descriptor for shared memory */
 @REQ(get_shared_memory)
-    thread_id_t tid;            /* thread id or 0 */
+    thread_id_t  tid;           /* thread id or 0 */
+    obj_handle_t handle;        /* handle to object or NULL */
+    int          release_old;
+@REPLY
+    client_ptr_t shm_id;        /* id for the current shared memory block object resides in */
+    unsigned int offset;        /* offset from start of shared memory to the object */
+    unsigned int size;          /* size of the shared memory region */
 @END
 
 
@@ -3846,4 +3865,10 @@ struct handle_info
 @REQ(terminate_job)
     obj_handle_t handle;          /* handle to the job */
     int          status;          /* process exit code */
+@END
+
+
+/* Notify server that an object is signaled */
+@REQ(notify_signaled)
+    obj_handle_t handle;          /* handle to the object */
 @END

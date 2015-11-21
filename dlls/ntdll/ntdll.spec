@@ -1499,3 +1499,11 @@
 @ cdecl wine_nt_to_unix_file_name(ptr ptr long long)
 @ cdecl wine_unix_to_nt_file_name(ptr ptr)
 @ cdecl __wine_init_windows_dir(wstr wstr)
+
+
+# HACK: Delete me please
+@ cdecl ntdll_object_release(ptr)
+@ cdecl ntdll_object_dump(ptr)
+@ cdecl ntdll_handle_find(long)
+@ cdecl virtual_shared_memory_dumpeth()
+@ cdecl ntdll_object_whose_use(ptr)

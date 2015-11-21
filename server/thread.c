@@ -607,12 +607,14 @@ static unsigned int end_wait( struct thread *thread, unsigned int status )
         if (wait->select == SELECT_WAIT_ALL)
         {
             for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
-                entry->obj->ops->satisfied( entry->obj, entry );
+                if (entry->obj->ops->satisfied)
+                    entry->obj->ops->satisfied( entry->obj, entry );
         }
         else
         {
             entry = wait->queues + status;
-            entry->obj->ops->satisfied( entry->obj, entry );
+            if (entry->obj->ops->satisfied)
+                entry->obj->ops->satisfied( entry->obj, entry );
         }
         if (wait->abandoned) status += STATUS_ABANDONED_WAIT_0;
     }
@@ -676,14 +678,33 @@ static int wait_on_handles( const select_op_t *select_op, unsigned int count, co
     return ret;
 }
 
-/* check if the thread waiting condition is satisfied */
-static int check_wait( struct thread *thread )
+/* returns TRUE if any threads other than the one passed are waiting on this object */
+static int other_waiters( struct object *obj, struct thread *thread )
 {
-    int i;
+    struct wait_queue_entry *i;
+
+    LIST_FOR_EACH_ENTRY(i, &obj->wait_queue, struct wait_queue_entry, entry)
+        if (i->wait != thread->wait)
+            return TRUE;
+
+    return FALSE;
+}
+
+/* check if the thread waiting condition is satisfied */
+/* TODO: It may be helpful to refactor this with a check_wait_all and check_wait_any.  */
+static int real_check_wait( struct thread *thread )
+{
+    int i, j;
     struct thread_wait *wait = thread->wait;
     struct wait_queue_entry *entry;
+    NTSTATUS ret = STATUS_WAIT_0;
+    NTSTATUS result;
+    ULONGLONG dupes = 0ull;
+    ULONGLONG shared_objects = 0ull;
 
     assert( wait );
+    assert( wait->count <= MAXIMUM_WAIT_OBJECTS );
+    assert( sizeof(dupes) * 8 <= MAXIMUM_WAIT_OBJECTS );
 
     if ((wait->flags & SELECT_INTERRUPTIBLE) && !list_empty( &thread->system_apc ))
         return STATUS_USER_APC;
@@ -691,24 +712,209 @@ static int check_wait( struct thread *thread )
     /* Suspended threads may not acquire locks, but they can run system APCs */
     if (thread->process->suspend + thread->suspend > 0) return -1;
 
+    /* Discover and mark all duplicate and hybrid objects in wait queue.  */
+    for (i = 0; i < wait->count; i++)
+    {
+        const ULONGLONG mask = 1ull << i;
+        struct object *obj = wait->queues[i].obj;
+
+        if (type_is_shared_object( obj ))
+            shared_objects |= mask;
+
+        for (j = i; j;)
+            if (wait->queues[--j].obj == obj)
+            {
+                dupes |= mask;
+                break;
+            }
+    }
+
+    /* bWaitAll == TRUE */
     if (wait->select == SELECT_WAIT_ALL)
     {
         int not_ok = 0;
-        /* Note: we must check them all anyway, as some objects may
-         * want to do something when signaled, even if others are not */
-        for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
+        ULONGLONG undo_list = 0;
+
+        /* Note: we must check them all normal objects anyway, as some (msg queues)
+         * may want to do something when signaled, even if others are not */
+        for (i = 0; i < wait->count; i++)
+        {
+            const ULONGLONG mask = 1ull << i;
+            entry = &wait->queues[i];
+
+            if ((dupes & mask) || (shared_objects & mask))
+                continue;
+
             not_ok |= !entry->obj->ops->signaled( entry->obj, entry );
-        if (!not_ok) return STATUS_WAIT_0;
+        }
+
+        /* If any normal objects are non-signaled then don't bother checking shared objects.
+         * We can check out-of-order like this for wait all, but not wait any. */
+        if (not_ok)
+            goto wait_unsatisfied;
+
+        /* If we don't have shared objects and we're OK, then we're done.  */
+        if (!shared_objects)
+            return STATUS_WAIT_0;
+
+#if 0
+/* DEBUG HACK */
+if (wait->count > 50)
+{
+    char debug_buf[2048];
+    for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
+    {
+        if (!type_is_shared_object( entry->obj ))
+            debug_buf[i] = 'x';
+        else if (dupes & (1ull << i))
+            debug_buf[i] = 'd';
+        else {
+            struct hybrid_server_object *ho = (void*)entry->obj;
+            debug_buf[i] = ho->any.ho.atomic.value->data ? '1' : '0';
+        }
     }
+    debug_buf[i] = 0;
+    fprintf( stderr, "%s\n", debug_buf);
+}
+#endif
+
+        /* all normal objects signaled, try to acquire locks on hybrid objects */
+        for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
+        {
+            const ULONGLONG mask = 1ull << i;
+
+            if ((dupes & mask) || !(shared_objects & mask))
+                continue;
+
+            /* In the case of bWaitAll == TRUE, we're only setting the SHM_SYNC_VALUE_WAKE_SERVER
+             * flag on the hybrid sync object that fails the test. */
+            result = entry->obj->ops->trywait_begin_trans( entry->obj, entry );
+            switch (result) {
+            case STATUS_SUCCESS:
+                undo_list |= mask;
+                continue;
+            case STATUS_WAS_LOCKED:
+                break;
+            default:
+                ret = result;
+                break;
+            }
+
+            /* We only reach this part of the loop upon failure, so perform rollback. */
+            for (--i; i >= 0; --i)
+            {
+                const ULONGLONG mask = 1ull << i;
+                entry = &wait->queues[i];
+
+                if (undo_list & mask)
+                {
+                    result = entry->obj->ops->trywait_rollback( entry->obj );
+
+                    /* We must complete rollback on all objects, even if an unexpected error
+                     * occurs. */
+                    if (result && !ret)
+                        ret = result;
+                }
+            }
+
+            if (ret)
+                return ret;
+            else
+                goto wait_unsatisfied;
+        }
+
+        /* Wait all satisfied: commit  */
+        for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
+        {
+            const ULONGLONG mask = 1ull << i;
+
+            if ((dupes & mask) || !(shared_objects & mask))
+                continue;
+
+            entry->obj->ops->trywait_commit( entry->obj, !other_waiters( entry->obj, thread ) );
+        }
+        return STATUS_WAIT_0;
+    }
+    /* bWaitAll == FALSE */
     else
     {
         for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
-            if (entry->obj->ops->signaled( entry->obj, entry )) return i;
+        {
+            const ULONGLONG mask = 1ull << i;
+
+            if (dupes & mask)
+                continue;
+
+            if (!(shared_objects & mask))
+            {
+                if (!entry->obj->ops->signaled( entry->obj, entry ))
+                    continue;
+                else
+                    ret = i;
+            }
+            else
+            {
+                /* TODO: We can change this to a non-transactional trywait that sets notify
+                 * (based upon other_waiters) upon failure. */
+                result = entry->obj->ops->trywait_begin_trans( entry->obj, entry );
+                switch (result)
+                {
+                case STATUS_WAS_LOCKED:
+                    continue;
+                case STATUS_SUCCESS:
+                    result = entry->obj->ops->trywait_commit( entry->obj, !other_waiters( entry->obj, thread ) );
+                    ret = result ? result : i;
+                    break;
+                default:
+                    ret = result;
+                    break;
+                }
+            }
+
+            /* Clear server notify bit from hybrid objects with no other waiters.  */
+            for (--i; i >= 0; --i)
+            {
+                const ULONGLONG mask = 1ull << i;
+                entry = &wait->queues[i];
+
+                if ((dupes & mask) || !(shared_objects & mask))
+                    continue;
+
+                if (!other_waiters( entry->obj, thread ))
+                {
+                    result = hybrid_server_object_clear_notify( (void*)entry->obj );
+                    if (result && ret <= STATUS_WAIT_63)
+                        ret = result;
+                }
+            }
+
+            return ret;
+        }
     }
 
+wait_unsatisfied:
     if ((wait->flags & SELECT_ALERTABLE) && !list_empty(&thread->user_apc)) return STATUS_USER_APC;
     if (wait->timeout <= current_time) return STATUS_TIMEOUT;
     return -1;
+}
+
+/* HACK: Temporary debug wrapper to verify state of hybrid objects */
+static int check_wait( struct thread *thread )
+{
+    unsigned value;
+    struct thread_wait *wait = thread->wait;
+    int result = real_check_wait( thread );
+    int i;
+
+    for (i = 0; i < wait->count; i++)
+    {
+        struct object *obj = wait->queues[i].obj;
+
+        if (type_is_shared_object( obj ))
+            hybrid_server_object_query ((struct hybrid_server_object*)obj, &value);
+    }
+
+    return result;
 }
 
 /* send the wakeup signal to a thread */
@@ -1786,5 +1992,16 @@ DECL_HANDLER(get_selector_entry)
     {
         get_selector_entry( thread, req->entry, &reply->base, &reply->limit, &reply->flags );
         release_object( thread );
+    }
+}
+
+DECL_HANDLER(notify_signaled)
+{
+    struct hybrid_server_object *hso = get_handle_hybrid_obj( current->process, req->handle, 0 );
+
+    if (hso)
+    {
+        wake_up( &hso->obj, 0 );
+        release_object( &hso->obj );
     }
 }
