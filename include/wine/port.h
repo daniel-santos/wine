@@ -50,6 +50,7 @@
 #ifdef HAVE_UNISTD_H
 # include <unistd.h>
 #endif
+#include <assert.h>
 
 
 /****************************************************************
@@ -562,5 +563,90 @@ extern __int64 interlocked_cmpxchg64( __int64 *dest, __int64 xchg, __int64 compa
 #define usleep                  __WINE_NOT_PORTABLE(usleep)
 
 #endif /* NO_LIBWINE_PORT */
+
+/* FIXME: clean up this crappiness */
+#define __int8 char
+#define __int16 short
+#define __int32 int
+
+/* read a volatile value atomically (even for 64 bits on a machine with a 32 bit word) */
+static inline void __atomic_read( void *dest, const volatile void *src, size_t size )
+{
+    switch (size)
+    {
+        case 1: *(__int8 *)dest = *(const volatile __int8 *)src; break;
+        case 2: *(__int16*)dest = *(const volatile __int16*)src; break;
+        /* TODO: Does ARM do atomic read/writes to 32 bit values in all cases? thumb mode? */
+        case 4: *(__int32*)dest = *(const volatile __int32*)src; break;
+        case 8:
+#ifdef __x86_64__
+        /* TODO: any other archs that can do an atomic read of 64 bits? */
+                *(__int64*)dest = *(const volatile __int64*)src; break;
+#else
+        {
+            __int64 old_value;
+            __int64 new_value;
+
+            /* possible "read w/o init' warning here */
+            new_value = *(volatile __int64*)dest;
+            do
+            {
+                old_value = new_value;
+                /* stupid trick for atomic read */
+                new_value = interlocked_cmpxchg64( (__int64 *)src, old_value, old_value );
+
+            } while (new_value != old_value);
+            *(__int64*)dest = new_value;
+        }
+        break;
+#endif
+        default:
+            assert(0);
+    }
+}
+
+/* write a volatile value atomically (even for 64 bits on a machine with a 32 bit word) */
+static inline void __atomic_write( volatile void *dest, const void *src, size_t size )
+{
+    switch (size)
+    {
+        case 1: *(volatile __int8 *)dest = *(const __int8 *)src; break;
+        case 2: *(volatile __int16*)dest = *(const __int16*)src; break;
+        case 4: *(volatile __int32*)dest = *(const __int32*)src; break;
+        case 8:
+#ifdef __x86_64__
+                *(volatile __int64*)dest = *(const __int64*)src; break;
+#else
+        {
+            __int64 old_value;
+            __int64 new_value;
+
+            new_value = *(const volatile __int64*)src;
+            do
+            {
+                old_value = new_value;
+                new_value = interlocked_cmpxchg64( (__int64 *)dest, *(const __int64*)src, old_value );
+
+            } while (new_value != old_value);
+        }
+        break;
+#endif
+        default:
+            assert(0);
+    }
+}
+
+#define atomic_read( dest, src ) \
+    do { \
+        assert( sizeof(*(dest)) == sizeof(*(src)) ); \
+        __atomic_read( dest, src, sizeof(*(dest)) ); \
+    } while(0)
+
+#define atomic_write( dest, src ) \
+    do { \
+        assert( sizeof(*(dest)) == sizeof(*(src)) ); \
+        __atomic_write( dest, src, sizeof(*(dest)) ); \
+    } while(0)
+
 
 #endif /* !defined(__WINE_WINE_PORT_H) */
