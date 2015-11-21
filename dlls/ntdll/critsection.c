@@ -50,15 +50,6 @@ static inline LONG interlocked_dec( PLONG dest )
     return interlocked_xchg_add( dest, -1 ) - 1;
 }
 
-static inline void small_pause(void)
-{
-#ifdef __i386__
-    __asm__ __volatile__( "rep;nop" : : : "memory" );
-#else
-    __asm__ __volatile__( "" : : : "memory" );
-#endif
-}
-
 #ifdef __linux__
 
 static int wait_op = 128; /*FUTEX_WAIT|FUTEX_PRIVATE_FLAG*/
@@ -550,7 +541,7 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
             {
                 if (interlocked_cmpxchg( &crit->LockCount, 0, -1 ) == -1) goto done;
             }
-            small_pause();
+            cpu_relax();
         }
     }
 
