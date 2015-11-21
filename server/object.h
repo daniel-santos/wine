@@ -2,6 +2,7 @@
  * Wine server objects
  *
  * Copyright (C) 1998 Alexandre Julliard
+ * Copyright (C) 2015-2016 Daniel Santos
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -28,6 +29,7 @@
 #include <sys/time.h>
 #include "wine/server_protocol.h"
 #include "wine/list.h"
+#include "wine/sync.h"
 
 #define DEBUG_OBJECTS
 
@@ -45,6 +47,7 @@ struct async;
 struct async_queue;
 struct winstation;
 struct object_type;
+struct process_group;
 
 
 struct unicode_str
@@ -93,6 +96,18 @@ struct object_ops
     int (*close_handle)(struct object *,struct process *,obj_handle_t);
     /* destroy on refcount == 0 */
     void (*destroy)(struct object *);
+/*    NTSTATUS (*trywait)(struct object *,struct wait_queue_entry *); */
+    /* If object is signaled, starts a wait-multi transaction. This sets the "locked" bit
+     * prohibiting other operations on the object until either commited or rolled back.
+     * if the object is not signaled, then its SHM_SYNC_VALUE_WAKE_SERVER flag is set
+     * (atomically) assuring that the next client that signals the object will notify
+     * the server so that the wait can complete */
+    NTSTATUS (*trywait_begin_trans)(struct object *,struct wait_queue_entry *);
+    /* commits a prior call to trywait_begin_trans() (clears "locked" bit). Also clears
+     * SHM_SYNC_VALUE_WAKE_SERVER if there are no other waiters */
+    NTSTATUS (*trywait_commit)(struct object *, int clear_notify);
+    /* rolls back a prior call to trywait_begin_trans() (clears "locked" bit and resets value) */
+    NTSTATUS (*trywait_rollback)(struct object *);
 };
 
 struct object
@@ -133,11 +148,13 @@ extern WCHAR *get_object_full_name( struct object *obj, data_size_t *ret_len );
 extern void dump_object_name( struct object *obj );
 extern struct object *lookup_named_object( struct object *root, const struct unicode_str *name,
                                            unsigned int attr, struct unicode_str *name_left );
-extern void *create_named_object( struct object *parent, const struct object_ops *ops,
-                                  const struct unicode_str *name, unsigned int attributes,
-                                  const struct security_descriptor *sd );
-extern void *open_named_object( struct object *parent, const struct object_ops *ops,
-                                const struct unicode_str *name, unsigned int attributes );
+extern void *create_named_polytype_object( struct object *parent,
+                                           const struct object_ops *const ops[], size_t ops_size,
+                                           const struct unicode_str *name, unsigned int attributes,
+                                           const struct security_descriptor *sd );
+extern void *open_named_polytype_object( struct object *parent,
+                                         const struct object_ops *const ops[], size_t ops_size,
+                                         const struct unicode_str *name, unsigned int attributes );
 extern void unlink_named_object( struct object *obj );
 extern void make_object_static( struct object *obj );
 extern struct namespace *create_namespace( unsigned int hash_size );
@@ -169,6 +186,22 @@ extern void no_destroy( struct object *obj );
 extern void dump_objects(void);
 extern void close_objects(void);
 #endif
+
+static inline void *create_named_object( struct object *parent, const struct object_ops *ops,
+                                         const struct unicode_str *name, unsigned int attributes,
+                                         const struct security_descriptor *sd )
+{
+    const struct object_ops *ops_array[1] = {ops};
+    return create_named_polytype_object( parent, ops_array, 1, name, attributes, sd );
+
+}
+
+static inline void *open_named_object( struct object *parent, const struct object_ops *ops,
+                                       const struct unicode_str *name, unsigned int attributes )
+{
+    const struct object_ops *ops_array[1] = {ops};
+    return open_named_polytype_object( parent, ops_array, !!ops, name, attributes );
+}
 
 /* event functions */
 
@@ -238,6 +271,94 @@ extern void init_directories(void);
 extern struct object *create_obj_symlink( struct object *root, const struct unicode_str *name,
                                           unsigned int attr, struct object *target,
                                           const struct security_descriptor *sd );
+
+extern int staging_sync;
+static inline int staging_sync_enabled( void )
+{
+    return staging_sync;
+}
+
+/* hybrid objects structs & functions */
+
+/* HARD ENABLED */
+//#define DEBUG_SHM_SYNC 1
+
+#ifndef DEBUG_SHM_SYNC
+# define DEBUG_SHM_SYNC 0
+#endif
+
+#if DEBUG_SHM_SYNC
+struct tracer;
+# include "wine/pretty_dump.h"
+extern FILE *shm_sync_log;
+extern struct tracer *shm_sync_tracer;
+extern void init_shm_sync_debug(void);
+//# define shm_sync_dbg(fmt, ...) fprintf(shm_sync_log, fmt, __VA_ARGS__)
+static int shm_sync_dbg( const char *fmt, ... )  __attribute__((format (printf, 1, 2)));
+static inline int shm_sync_dbg( const char *fmt, ... )
+{
+    va_list args;
+    int ret;
+    va_start(args, fmt);
+    ret = vfprintf(shm_sync_log, fmt, args);
+    va_end(args);
+    return ret;
+}
+# define shm_sync_trace(fmt, ...) tracer_do(shm_sync_tracer, fmt, __VA_ARGS__)
+#else
+# define shm_sync_dbg(fmt, ...) do{}while(0)
+# define shm_sync_trace(fmt, ...) do{}while(0)
+#endif
+
+/******************************************************************************
+ *              struct hybrid_server_object
+ *
+ * A specialization of struct object containing a server-side private portion
+ * and a portion that may exist in either private or shared memory.
+ *
+ * Hybrid objects are only useable in the context of a thread.
+ *
+ */
+struct hybrid_server_object
+{
+    struct object           obj;            /* base class object */
+    union hybrid_object_any any;
+    union shm_sync_value    trans_state;    /* stores value when transaction starts to verify that it is unchanged */
+    struct process_group   *process_group;  /* process group this object belongs to */
+    struct list             entry;          /* entry in process group */
+};
+
+extern int hybrid_server_object_init( struct hybrid_server_object *hso, struct shm_object_info *info, struct process *process );
+extern void hybrid_server_object_destroy( struct hybrid_server_object *hso );
+extern int hybrid_server_object_get_info( struct hybrid_server_object *hso, struct shm_object_info *info, struct process *process );
+extern int hybrid_server_object_migrate( struct hybrid_server_object *hso, struct shm_object_info *info );
+extern NTSTATUS hybrid_server_object_clear_notify( struct hybrid_server_object *hso );
+extern void __hybrid_server_object_check_bad( void );
+extern NTSTATUS hybrid_server_object_query( struct hybrid_server_object *hso, unsigned int *value );
+
+static inline int type_is_shared_object( struct object *obj )
+{
+    /* This is the current test, but this probably needs something cleaner */
+    return !!obj->ops->trywait_begin_trans;
+}
+
+static inline int hybrid_server_object_is_bad( struct hybrid_server_object *hso )
+{
+    return hybrid_object_bad( &hso->any.ho );
+}
+
+static inline void hybrid_server_object_check( struct hybrid_server_object *hso )
+{
+    if (hybrid_server_object_is_bad( hso ))
+        __hybrid_server_object_check_bad();
+}
+
+extern obj_handle_t shared_object_open( struct process *process, obj_handle_t parent,
+                                               unsigned int access,
+                                               const struct object_ops *private_type,
+                                               const struct object_ops *shared_type,
+                                               const struct unicode_str *name, unsigned int attr,
+                                               struct shm_object_info *info);
 
 /* global variables */
 

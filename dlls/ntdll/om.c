@@ -383,6 +383,9 @@ NTSTATUS close_handle( HANDLE handle )
     NTSTATUS ret;
     int fd = server_remove_fd_from_cache( handle );
 
+    if (fd == -1 && (ret = ntdll_handle_remove( handle ) != STATUS_INVALID_HANDLE))
+        return ret;
+
     SERVER_START_REQ( close_handle )
     {
         req->handle = wine_server_obj_handle( handle );
@@ -390,6 +393,7 @@ NTSTATUS close_handle( HANDLE handle )
     }
     SERVER_END_REQ;
     if (fd != -1) close( fd );
+
     return ret;
 }
 

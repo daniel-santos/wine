@@ -370,13 +370,13 @@ HWND WINAPI GetFocus(void)
 HWND WINAPI GetForegroundWindow(void)
 {
     struct user_thread_info *thread_info = get_user_thread_info();
-    shmglobal_t *shm = wine_get_shmglobal();
+    const volatile shmglobal_t *shm = wine_get_shmglobal();
     HWND ret = 0;
     DWORD epoch;
 
     if (shm)
     {
-        epoch = interlocked_xchg_add( (int*)&shm->foreground_wnd_epoch, 0 );
+        epoch = shm->foreground_wnd_epoch;
 
         if (epoch == thread_info->foreground_wnd_epoch)
             return thread_info->foreground_wnd;

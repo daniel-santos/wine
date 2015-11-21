@@ -258,6 +258,9 @@ int wine_dbg_log( enum __wine_debug_class cls, struct __wine_debug_channel *chan
     return ret;
 }
 
+__attribute__((noinline)) void wine_dbg_gonnadie( void )
+{
+}
 
 /* allocate some tmp string space */
 /* FIXME: this is not 100% thread-safe */

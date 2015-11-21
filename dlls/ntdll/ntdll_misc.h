@@ -23,11 +23,16 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <pthread.h>
+#include <sys/sysmacros.h>
 
 #include "windef.h"
 #include "winnt.h"
 #include "winternl.h"
 #include "wine/server.h"
+#include "wine/rbtree.h"
+#include "wine/list.h"
+#define SYNC_H_ATTR DECLSPEC_HIDDEN
+#include "wine/sync.h"
 
 #define MAX_NT_PATH_LENGTH 277
 
@@ -100,10 +105,11 @@ extern int server_remove_fd_from_cache( HANDLE handle ) DECLSPEC_HIDDEN;
 extern int server_get_unix_fd( HANDLE handle, unsigned int access, int *unix_fd,
                                int *needs_close, enum server_fd_type *type, unsigned int *options ) DECLSPEC_HIDDEN;
 extern int server_pipe( int fd[2] ) DECLSPEC_HIDDEN;
+extern NTSTATUS server_get_object_shared_memory( HANDLE obj, struct shm_object_info *info ) DECLSPEC_HIDDEN;
+extern NTSTATUS server_wake( HANDLE obj ) DECLSPEC_HIDDEN;
 extern NTSTATUS alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
                                          data_size_t *ret_len ) DECLSPEC_HIDDEN;
 extern NTSTATUS validate_open_object_attributes( const OBJECT_ATTRIBUTES *attr ) DECLSPEC_HIDDEN;
-extern void *server_get_shared_memory( HANDLE thread ) DECLSPEC_HIDDEN;
 
 /* module handling */
 extern LIST_ENTRY tls_links DECLSPEC_HIDDEN;
@@ -166,6 +172,7 @@ extern NTSTATUS nt_to_unix_file_name_attr( const OBJECT_ATTRIBUTES *attr, ANSI_S
                                            UINT disposition ) DECLSPEC_HIDDEN;
 
 /* virtual memory */
+struct shared_memory_block;
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info ) DECLSPEC_HIDDEN;
 extern NTSTATUS virtual_create_builtin_view( void *base ) DECLSPEC_HIDDEN;
 extern NTSTATUS virtual_alloc_thread_stack( TEB *teb, SIZE_T reserve_size,
@@ -186,6 +193,16 @@ extern void VIRTUAL_SetForceExec( BOOL enable ) DECLSPEC_HIDDEN;
 extern void virtual_release_address_space(void) DECLSPEC_HIDDEN;
 extern void virtual_set_large_address_space(void) DECLSPEC_HIDDEN;
 extern struct _KUSER_SHARED_DATA *user_shared_data DECLSPEC_HIDDEN;
+extern NTSTATUS virtual_get_shared_memory( struct shared_memory_block **shm_ptr,
+                                           struct shm_object_info *info );
+extern void virtual_release_shared_memory( void *addr ) DECLSPEC_HIDDEN;
+/* HACK */
+struct shm_dbg {
+    void       *base;
+    unsigned    size;
+    unsigned    refcount;
+};
+extern SIZE_T virtual_shared_memory_dumpeth( struct shm_dbg **p, HANDLE heap );
 
 /* completion */
 extern NTSTATUS NTDLL_AddCompletion( HANDLE hFile, ULONG_PTR CompletionValue,
@@ -255,5 +272,75 @@ extern HANDLE keyed_event DECLSPEC_HIDDEN;
 #define HASH_STRING_ALGORITHM_INVALID  0xffffffff
 
 NTSTATUS WINAPI RtlHashUnicodeString(PCUNICODE_STRING,BOOLEAN,ULONG,ULONG*);
+
+/* TODO: trim list down to what we're actually going to use client-side */
+enum ntdll_obj_type_id {
+    NTDLL_OBJ_TYPE_ID_ASYNC,                       /* async I/O */
+    NTDLL_OBJ_TYPE_ID_EVENT,                       /* event */
+    NTDLL_OBJ_TYPE_ID_COMPLETION,                  /* IO completion ports */
+    NTDLL_OBJ_TYPE_ID_FILE,                        /* file */
+    NTDLL_OBJ_TYPE_ID_MAILSLOT,                    /* +2 chain mail slot */
+    NTDLL_OBJ_TYPE_ID_MUTEX,                       /* mutex */
+    NTDLL_OBJ_TYPE_ID_MSG_QUEUE,                   /* message queue */
+    NTDLL_OBJ_TYPE_ID_PROCESS,                     /* process */
+    NTDLL_OBJ_TYPE_ID_SEMAPHORE,                   /* semaphore */
+    NTDLL_OBJ_TYPE_ID_THREAD,                      /* thread */
+    NTDLL_OBJ_TYPE_ID_WAITABLE_TIMER,              /* waitable timer */
+
+    NTDLL_OBJ_TYPE_ID_MAX
+};
+
+struct ntdll_object;
+
+struct ntdll_object_type {
+    enum ntdll_obj_type_id id;
+    /* wait on the object */
+    NTSTATUS            (*wait)        (struct ntdll_object *obj, timeout_t timeout);
+    /* attempt to obtain lock on object, return STATUS_SUCCESS or STATUS_WAS_LOCKED upon failure. */
+    NTSTATUS            (*trywait)     (struct ntdll_object *obj);
+    /* close the client-side object */
+    void                (*close)       (struct ntdll_object *obj);
+    /* Dump a description of the object to the supplied buffer. The implementation should
+     * generally call ntdll_object_dump_base() to describe it's struct ntdll_object member.*/
+    void                (*dump)        (const struct ntdll_object *obj, char **start, const char *const end);
+};
+
+/* process-local data for ntdll objects
+ *
+ * If is possible to have more than one ntdll_object representing the same logical object via
+ * DuplicateHandle, OpenXxxx, etc -- even in the same process. When the object is client-private,
+ * subsequent
+ *
+ *
+ */
+struct ntdll_object {
+    struct ntdll_object_type   *type;       /* type */
+    union hybrid_object_any     any __attribute__((aligned(16)));
+    int                         private:1;
+    HANDLE                      h;          /* handle to the object (may be more than one handle to the same server-side obj) */
+    struct wine_rb_entry        tree_entry; /* red-black tree node for handle database */
+    struct list                 list_entry;
+};
+
+/* HACK: some functions exposed for debugging */
+extern NTSTATUS              ntdll_object_db_init(void) DECLSPEC_HIDDEN;
+extern NTSTATUS              ntdll_object_new(struct ntdll_object **dest, const HANDLE h, size_t size,
+                                              struct ntdll_object_type *type,
+                                              struct shm_object_info *info_ptr) DECLSPEC_HIDDEN;
+extern NTSTATUS DECLSPEC_MUST_CHECK ntdll_object_grab(struct ntdll_object *obj) DECLSPEC_HIDDEN;
+extern NTSTATUS DECLSPEC_MUST_CHECK ntdll_object_release(struct ntdll_object *obj);// DECLSPEC_HIDDEN;
+extern void                  ntdll_object_dump_base(const struct ntdll_object *obj, char **start,
+                                                    const char *const end) DECLSPEC_HIDDEN;
+extern const char           *ntdll_object_dump(const struct ntdll_object *obj);// DECLSPEC_HIDDEN;
+extern NTSTATUS              ntdll_handle_add(struct ntdll_object *obj) DECLSPEC_HIDDEN;
+extern NTSTATUS              ntdll_handle_remove(const HANDLE h) DECLSPEC_HIDDEN;
+extern struct ntdll_object  *ntdll_handle_find(const HANDLE h);// DECLSPEC_HIDDEN;
+extern void                  ntdll_object_whose_use(void *ptr);
+
+extern int shm_sync_enabled;
+static inline int have_shm_sync(void)
+{
+    return shm_sync_enabled;
+}
 
 #endif
