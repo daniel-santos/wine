@@ -2,6 +2,7 @@
  * ffs function
  *
  * Copyright 2004 Hans Leidekker
+ *           2015, 2017 Daniel Santos
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -26,6 +27,7 @@ int ffs( int x )
 {
     int bit;
 
+    /* Passing zero is always UB, but we can't have an infinate loop.  */
     if (!x)
         return 0;
 
@@ -36,10 +38,11 @@ int ffs( int x )
 #endif /* HAVE_FFS */
 
 #ifndef HAVE_FFSL
-int ffsl(long int x)
+int ffsl( long int x )
 {
     int bit;
 
+    /* Passing zero is always UB, but we can't have an infinate loop.  */
     if (!x)
         return 0;
 

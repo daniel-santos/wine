@@ -50,15 +50,6 @@ static inline LONG interlocked_dec( PLONG dest )
     return interlocked_xchg_add( dest, -1 ) - 1;
 }
 
-static inline void small_pause(void)
-{
-#ifdef __i386__
-    __asm__ __volatile__( "rep;nop" : : : "memory" );
-#else
-    __asm__ __volatile__( "" : : : "memory" );
-#endif
-}
-
 #ifdef __linux__
 
 static int wait_op = 128; /*FUTEX_WAIT|FUTEX_PRIVATE_FLAG*/
@@ -209,7 +200,7 @@ static inline HANDLE get_semaphore( RTL_CRITICAL_SECTION *crit )
     if (!ret)
     {
         HANDLE sem;
-        if (NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS, NULL, 0, 1 )) return 0;
+        if (NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS | SYNC_OBJECT_ACCESS_SERVER_ONLY, NULL, 0, 1 )) return 0;
         if (!(ret = interlocked_cmpxchg_ptr( &crit->LockSemaphore, sem, 0 )))
             ret = sem;
         else
@@ -550,7 +541,7 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
             {
                 if (interlocked_cmpxchg( &crit->LockCount, 0, -1 ) == -1) goto done;
             }
-            small_pause();
+            cpu_relax();
         }
     }
 

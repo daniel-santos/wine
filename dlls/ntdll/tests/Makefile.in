@@ -20,6 +20,7 @@ C_SRCS = \
 	rtl.c \
 	rtlbitmap.c \
 	rtlstr.c \
+	semaphore.c \
 	string.c \
 	threadpool.c \
 	time.c
