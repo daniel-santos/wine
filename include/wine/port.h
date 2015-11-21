@@ -564,6 +564,15 @@ extern __int64 interlocked_cmpxchg64( __int64 *dest, __int64 xchg, __int64 compa
 
 #endif /* NO_LIBWINE_PORT */
 
+static inline void cpu_relax(void)
+{
+#ifdef __i386__
+    __asm__ __volatile__( "rep;nop" : : : "memory" );
+#else
+    __asm__ __volatile__( "" : : : "memory" );
+#endif
+}
+
 /* FIXME: clean up this crappiness */
 #define __int8 char
 #define __int16 short
