@@ -24,41 +24,27 @@
 #ifndef HAVE_FFS
 int ffs( int x )
 {
-    unsigned int y = (unsigned int)x;
+    int bit;
 
-    if (y & 0x00000001) return 1;
-    if (y & 0x00000002) return 2;
-    if (y & 0x00000004) return 3;
-    if (y & 0x00000008) return 4;
-    if (y & 0x00000010) return 5;
-    if (y & 0x00000020) return 6;
-    if (y & 0x00000040) return 7;
-    if (y & 0x00000080) return 8;
-    if (y & 0x00000100) return 9;
-    if (y & 0x00000200) return 10;
-    if (y & 0x00000400) return 11;
-    if (y & 0x00000800) return 12;
-    if (y & 0x00001000) return 13;
-    if (y & 0x00002000) return 14;
-    if (y & 0x00004000) return 15;
-    if (y & 0x00008000) return 16;
-    if (y & 0x00010000) return 17;
-    if (y & 0x00020000) return 18;
-    if (y & 0x00040000) return 19;
-    if (y & 0x00080000) return 20;
-    if (y & 0x00100000) return 21;
-    if (y & 0x00200000) return 22;
-    if (y & 0x00400000) return 23;
-    if (y & 0x00800000) return 24;
-    if (y & 0x01000000) return 25;
-    if (y & 0x02000000) return 26;
-    if (y & 0x04000000) return 27;
-    if (y & 0x08000000) return 28;
-    if (y & 0x10000000) return 29;
-    if (y & 0x20000000) return 30;
-    if (y & 0x40000000) return 31;
-    if (y & 0x80000000) return 32;
+    if (!x)
+        return 0;
 
-    return 0;
+    for (bit = 1;; ++bit, x >>= 1)
+        if (x & 1)
+            return bit;
 }
 #endif /* HAVE_FFS */
+
+#ifndef HAVE_FFSL
+int ffsl(long int x)
+{
+    int bit;
+
+    if (!x)
+        return 0;
+
+    for (bit = 1;; ++bit, x >>= 1)
+        if (x & 1l)
+            return bit;
+}
+#endif /* HAVE_FFSL */
