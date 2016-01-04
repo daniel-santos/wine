@@ -61,6 +61,7 @@ static NTSTATUS (WINAPI *pNtAllocateVirtualMemory)(HANDLE, PVOID *, ULONG, SIZE_
 static NTSTATUS (WINAPI *pNtFreeVirtualMemory)(HANDLE, PVOID *, SIZE_T *, ULONG);
 static NTSTATUS (WINAPI *pNtWaitForSingleObject)(HANDLE, BOOLEAN, const LARGE_INTEGER *);
 static NTSTATUS (WINAPI *pNtWaitForMultipleObjects)(ULONG,const HANDLE*,BOOLEAN,BOOLEAN,const LARGE_INTEGER*);
+static NTSTATUS (WINAPI *pNtQuerySemaphore)(HANDLE handle, SEMAPHORE_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len);
 
 static void test_signalandwait(void)
 {
@@ -138,8 +139,10 @@ static void test_signalandwait(void)
     r = ReleaseSemaphore(semaphore[0],1,NULL);
     ok( r == FALSE, "should fail\n");
 
+    SetLastError(0xdeadbeef);
     r = ReleaseSemaphore(semaphore[1],1,NULL);
     ok( r == TRUE, "should succeed\n");
+    ok( GetLastError() == 0xdeadbeef, "last error was %08x, expected 0xdeadbeef\n", GetLastError());
 
     CloseHandle(semaphore[0]);
     CloseHandle(semaphore[1]);
@@ -1168,6 +1171,7 @@ static void test_WaitForSingleObject(void)
 
 static void test_WaitForMultipleObjects(void)
 {
+    SEMAPHORE_BASIC_INFORMATION sem_info;
     LARGE_INTEGER timeout;
     NTSTATUS status;
     DWORD r;
@@ -1240,6 +1244,38 @@ static void test_WaitForMultipleObjects(void)
     maxevents[0] = GetCurrentThread();
     status = pNtWaitForMultipleObjects(1, maxevents, TRUE, FALSE, &timeout);
     todo_wine ok(status == STATUS_INVALID_HANDLE, "expected STATUS_INVALID_HANDLE, got %08x\n", status);
+
+    /* according to docs, handle list must not contain duplicates, but it doesn't seem to mind */
+    maxevents[0] = CreateSemaphoreA(NULL, 2, 2, NULL);
+    maxevents[1] = maxevents[0];
+    SetLastError(0xdeadbeef);
+    r = WaitForMultipleObjects(2, maxevents, FALSE, 0);
+    ok( r == STATUS_WAIT_0, "WaitForMultipleObjects returned got %d\n", r);
+    ok( GetLastError() == 0xdeadbeef, "expected 0xdeadbeef, got %08x\n",
+        GetLastError());
+    status = pNtQuerySemaphore(maxevents[0], SemaphoreBasicInformation, &sem_info, sizeof(sem_info), NULL);
+    ok( status == 0, "NtQuerySemaphore failed with %08x\n", status );
+    ok( sem_info.CurrentCount == 1, "expected wait multiple with dupe semaphore handles to only "
+        "consume one signal, but .CurrentCount = %d\n", sem_info.CurrentCount );
+    trace(".CurrentCount = %d, .MaximumCount = %d\n", sem_info.CurrentCount, sem_info.MaximumCount);
+    CloseHandle(maxevents[0]);
+
+    /* now repeat test after using DuplicateHandle */
+    maxevents[0] = CreateSemaphoreA(NULL, 2, 2, NULL);
+    ok (DuplicateHandle(GetCurrentProcess(), maxevents[0], GetCurrentProcess(), &maxevents[1], 0,
+                        FALSE, DUPLICATE_SAME_ACCESS), "DuplicateHandle of semaphore\n");
+    SetLastError(0xdeadbeef);
+    r = WaitForMultipleObjects(2, maxevents, FALSE, 0);
+    ok( r == STATUS_WAIT_0, "WaitForMultipleObjects returned got %d\n", r);
+    ok( GetLastError() == 0xdeadbeef, "expected 0xdeadbeef, got %08x\n",
+        GetLastError());
+    status = pNtQuerySemaphore(maxevents[0], SemaphoreBasicInformation, &sem_info, sizeof(sem_info), NULL);
+    ok( status == 0, "NtQuerySemaphore failed with %08x\n", status );
+    ok( sem_info.CurrentCount == 1, "expected wait multiple with dupe semaphore handles to only "
+        "consume one signal, but .CurrentCount = %d\n", sem_info.CurrentCount );
+    trace(".CurrentCount = %d, .MaximumCount = %d\n", sem_info.CurrentCount, sem_info.MaximumCount);
+    CloseHandle(maxevents[0]);
+    CloseHandle(maxevents[1]);
 }
 
 static BOOL g_initcallback_ret, g_initcallback_called;
@@ -2574,6 +2610,7 @@ START_TEST(sync)
     pNtFreeVirtualMemory = (void *)GetProcAddress(hntdll, "NtFreeVirtualMemory");
     pNtWaitForSingleObject = (void *)GetProcAddress(hntdll, "NtWaitForSingleObject");
     pNtWaitForMultipleObjects = (void *)GetProcAddress(hntdll, "NtWaitForMultipleObjects");
+    pNtQuerySemaphore = (void *)GetProcAddress(hntdll, "NtQuerySemaphore");
 
     argc = winetest_get_mainargs( &argv );
     if (argc >= 3)
