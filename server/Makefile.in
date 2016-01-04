@@ -23,6 +23,7 @@ C_SRCS = \
 	mutex.c \
 	named_pipe.c \
 	object.c \
+	pretty_dump.c \
 	process.c \
 	procfs.c \
 	ptrace.c \
