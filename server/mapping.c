@@ -186,7 +186,15 @@ static int check_current_dir_for_exec(void)
     return (ret != MAP_FAILED);
 }
 
-/* allocates a block of shared memory */
+/***********************************************************************
+ *           allocate_shared_memory
+ *
+ * allocates a block of shared memory
+ *
+ * RETURNS
+ *  Success: non-zero
+ *  Failure: zero
+ */
 int allocate_shared_memory( int *fd, void **memory, size_t size )
 {
 #if defined(__linux__) && (defined(__i386__) || defined(__x86_64__))
@@ -194,23 +202,36 @@ int allocate_shared_memory( int *fd, void **memory, size_t size )
     int shm_fd;
 
     shm_fd = syscall( __NR_memfd_create, "wineserver_shm", MFD_ALLOW_SEALING );
-    if (shm_fd == -1) goto err;
-    if (grow_file( shm_fd, size ))
+    if (shm_fd == -1)
     {
-        if (fcntl( shm_fd, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW ) >= 0)
-        {
-            shm_mem = mmap( 0, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0 );
-            if (shm_mem != MAP_FAILED)
-            {
-                memset( shm_mem, 0, size );
-                *fd     = shm_fd;
-                *memory = shm_mem;
-                return 1;
-            }
-        }
+        perror("wineserver: allocate_shared_memory: memfd_create");
+        file_set_error();
+        goto err;
     }
+
+    if (!grow_file( shm_fd, size ))
+        goto err_close_file;
+
+    if (fcntl( shm_fd, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW ) < 0)
+    {
+        perror("wineserver: allocate_shared_memory: fcntl(F_ADD_SEALS)");
+        file_set_error();
+        goto err_close_file;
+    }
+
+    shm_mem = mmap( 0, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0 );
+    if (shm_mem == MAP_FAILED)
+        goto err_close_file;
+
+    memset( shm_mem, 0, size );
+    *fd     = shm_fd;
+    *memory = shm_mem;
+    return 1;
+
+err_close_file:
     close( shm_fd );
 err:
+    assert( global_error );
 #endif
     *memory = NULL;
     *fd = -1;
@@ -229,7 +250,16 @@ void release_shared_memory( int fd, void *memory, size_t size )
 /* intialize shared memory management */
 void init_shared_memory( void )
 {
-    allocate_shared_memory( &shmglobal_fd, (void **)&shmglobal, sizeof(*shmglobal) );
+    const char *val;
+
+    val = getenv( "STAGING_SHARED_MEMORY" );
+    if (val && atoi( val ))
+        allocate_shared_memory( &shmglobal_fd, (void **)&shmglobal, sizeof(*shmglobal) );
+    else
+    {
+        shmglobal_fd = -1;
+        shmglobal = NULL;
+    }
 }
 
 /* create a temp file for anonymous mappings */
