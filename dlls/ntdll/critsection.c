@@ -200,7 +200,7 @@ static inline HANDLE get_semaphore( RTL_CRITICAL_SECTION *crit )
     if (!ret)
     {
         HANDLE sem;
-        if (NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS, NULL, 0, 1 )) return 0;
+        if (NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS | SYNC_OBJECT_ACCESS_SERVER_ONLY, NULL, 0, 1 )) return 0;
         if (!(ret = interlocked_cmpxchg_ptr( &crit->LockSemaphore, sem, 0 )))
             ret = sem;
         else
