@@ -44,6 +44,7 @@ extern struct object *get_handle_obj( struct process *process, obj_handle_t hand
 extern struct hybrid_server_object *get_handle_hybrid_obj( struct process *process,
                                                            obj_handle_t handle,
                                                            unsigned int access );
+extern unsigned int count_handles( const struct object *obj, struct process *process, obj_handle_t exclude );
 extern unsigned int get_handle_access( struct process *process, obj_handle_t handle );
 extern obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, struct process *dst,
                                       unsigned int access, unsigned int attr, unsigned int options );
