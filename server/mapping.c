@@ -260,6 +260,9 @@ void init_shared_memory( void )
         shmglobal_fd = -1;
         shmglobal = NULL;
     }
+
+    val = getenv( "STAGING_SHM_SYNC" );
+    staging_sync = val && atoi( val );
 }
 
 /* create a temp file for anonymous mappings */

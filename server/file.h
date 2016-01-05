@@ -154,6 +154,11 @@ extern void init_shared_memory( void );
 extern shmglobal_t *shmglobal;
 extern int          shmglobal_fd;
 
+static inline int have_shm(void)
+{
+    return !!shmglobal;
+}
+
 /* change notification functions */
 
 extern void do_change_notify( int unix_fd );

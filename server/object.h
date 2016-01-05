@@ -2,6 +2,7 @@
  * Wine server objects
  *
  * Copyright (C) 1998 Alexandre Julliard
+ * Copyright (C) 2015-2016 Daniel Santos
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -28,6 +29,7 @@
 #include <sys/time.h>
 #include "wine/server_protocol.h"
 #include "wine/list.h"
+#include "wine/sync.h"
 
 #define DEBUG_OBJECTS
 
@@ -46,6 +48,7 @@ struct async_queue;
 struct winstation;
 struct directory;
 struct object_type;
+struct process_group;
 
 
 struct unicode_str
@@ -90,6 +93,18 @@ struct object_ops
     int (*close_handle)(struct object *,struct process *,obj_handle_t);
     /* destroy on refcount == 0 */
     void (*destroy)(struct object *);
+/*    NTSTATUS (*trywait)(struct object *,struct wait_queue_entry *); */
+    /* If object is signaled, starts a wait-multi transaction. This sets the "locked" bit
+     * prohibiting other operations on the object until either commited or rolled back.
+     * if the object is not signaled, then its SHM_SYNC_VALUE_NOTIFY_SVR flag is set
+     * (atomically) assuring that the next client that signals the object will notify
+     * the server so that the wait can complete */
+    NTSTATUS (*trywait_begin_trans)(struct object *,struct wait_queue_entry *);
+    /* commits a prior call to trywait_begin_trans() (clears "locked" bit). Also clears
+     * SHM_SYNC_VALUE_NOTIFY_SVR if there are no other waiters */
+    NTSTATUS (*trywait_commit)(struct object *, int clear_notify);
+    /* rolls back a prior call to trywait_begin_trans() (clears "locked" bit and resets value) */
+    NTSTATUS (*trywait_rollback)(struct object *);
 };
 
 struct object
@@ -223,6 +238,63 @@ extern void init_directories(void);
 
 extern struct symlink *create_symlink( struct directory *root, const struct unicode_str *name,
                                        unsigned int attr, const struct unicode_str *target );
+
+extern int staging_sync;
+static inline int staging_sync_enabled( void )
+{
+    return staging_sync;
+}
+
+/* hybrid objects structs & functions */
+
+/******************************************************************************
+ *              struct hybrid_server_object
+ *
+ * A specialization of struct object containing a server-side private portion
+ * and a portion that may exist in either private or shared memory.
+ *
+ * Hybrid objects are only useable in the context of a thread.
+ *
+ */
+struct hybrid_server_object
+{
+    struct object           obj;            /* base class object */
+    union hybrid_object_any any;
+    union shm_sync_value    trans_state;    /* stores value when transaction starts to verify that it is unchanged */
+    struct process_group   *process_group;  /* process group this object belongs to */
+    struct list             entry;          /* entry in process group */
+};
+
+extern int hybrid_server_object_init( struct hybrid_server_object *hso, struct shm_object_info *info, int flags );
+extern void hybrid_server_object_destroy( struct hybrid_server_object *hso );
+extern int hybrid_server_object_get_info( struct hybrid_server_object *hso, struct shm_object_info *info );
+extern int hybrid_server_object_migrate( struct hybrid_server_object *hso, struct shm_object_info *info );
+extern NTSTATUS hybrid_server_object_clear_notify( struct hybrid_server_object *hso );
+extern void __hybrid_server_object_check_bad( void );
+
+static inline int type_is_hybrid_object( struct object *obj )
+{
+    /* This is the current test, but this probably needs something cleaner */
+    return !!obj->ops->trywait_begin_trans;
+}
+
+/* Returns true if the object is a hybrid_object and uses shared memory. */
+static inline int object_is_shared( struct object *obj )
+{
+    struct hybrid_server_object *hso = (void*)obj;
+    return type_is_hybrid_object( obj ) && !hybrid_object_is_server_private( &hso->any.ho );
+}
+
+static inline int hybrid_server_object_is_bad( struct hybrid_server_object *hso )
+{
+    return hybrid_object_bad( &hso->any.ho );
+}
+
+static inline void hybrid_server_object_check( struct hybrid_server_object *hso )
+{
+    if (hybrid_server_object_is_bad( hso ))
+        __hybrid_server_object_check_bad();
+}
 
 /* global variables */
 

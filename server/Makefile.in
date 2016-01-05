@@ -16,6 +16,7 @@ C_SRCS = \
 	file.c \
 	handle.c \
 	hook.c \
+	hybrid_object.c \
 	mach.c \
 	mailslot.c \
 	main.c \
