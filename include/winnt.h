@@ -122,7 +122,7 @@ extern "C" {
 #ifndef FORCEINLINE
 # if defined(_MSC_VER) && (_MSC_VER >= 1200)
 #  define FORCEINLINE __forceinline
-# elif defined(__GNUC__) && ((__GNUC__ > 3) || ((__GNUC__ == 3) && (__GNUC_MINOR__ >= 2)))
+# elif defined(__GNUC__) && ((__GNUC__ > 3) || ((__GNUC__ == 3) && (__GNUC_MINOR__ >= 2))) && !defined(__OPTIMIZE__)
 #  define FORCEINLINE inline __attribute__((always_inline))
 # else
 #  define FORCEINLINE inline
@@ -166,6 +166,47 @@ extern "C" {
 #define __WINE_ALLOC_SIZE(x) __attribute__((__alloc_size__(x)))
 #else
 #define __WINE_ALLOC_SIZE(x)
+#endif
+
+/* TODO: cleanup */
+#ifdef __GNUC__
+# ifndef __noinline
+#  define __noinline __attribute__((noinline))
+# endif
+# ifndef __cold
+#  define __cold __attribute__((cold))
+# endif
+# ifndef likely
+#  define likely( x )   __builtin_expect( (x), 1 )
+# endif
+# ifndef unlikely
+#  define unlikely( x ) __builtin_expect( (x), 0 )
+# endif
+# ifndef unreachable
+#  define unreachable() __builtin_unreachable()
+# endif
+# ifndef __must_check
+#  define __must_check  __attribute__((warn_unused_result))
+# endif
+#endif
+
+#ifndef __noinline
+# define __noinline
+#endif
+#ifndef __cold
+# define __cold
+#endif
+#ifndef likely
+# define likely( x )            (x)
+#endif
+#ifndef unlikely
+# define unlikely( x )          (x)
+#endif
+#ifndef unreachable
+# define unreachable()          do{}while(0)
+#endif
+#ifndef __must_check
+# define __must_check
 #endif
 
 /* Anonymous union/struct handling */
