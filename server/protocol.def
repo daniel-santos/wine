@@ -1127,6 +1127,9 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     unsigned int offset;        /* offset from start of shared memory to the object */
 @END
 
+/* (a slight hack) bit set in access mask for NTCreateSemaphore, et. al., to dictate a server-only object */
+#define SYNC_OBJECT_ACCESS_SERVER_ONLY    0x8000
+#define SYNC_OBJECT_ACCESS_MASK           (~SYNC_OBJECT_ACCESS_SERVER_ONLY)
 
 /* Release a semaphore */
 @REQ(release_semaphore)
