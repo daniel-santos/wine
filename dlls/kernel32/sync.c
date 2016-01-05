@@ -363,7 +363,7 @@ void WINAPI MakeCriticalSectionGlobal( CRITICAL_SECTION *crit )
 {
     /* let's assume that only one thread at a time will try to do this */
     HANDLE sem = crit->LockSemaphore;
-    if (!sem) NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS, NULL, 0, 1 );
+    if (!sem) NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS | SYNC_OBJECT_ACCESS_SERVER_ONLY, NULL, 0, 1 );
     crit->LockSemaphore = ConvertToGlobalHandle( sem );
     RtlFreeHeap( GetProcessHeap(), 0, crit->DebugInfo );
     crit->DebugInfo = NULL;
