@@ -41,6 +41,9 @@ extern obj_handle_t alloc_handle_no_access_check( struct process *process, void 
 extern unsigned int close_handle( struct process *process, obj_handle_t handle );
 extern struct object *get_handle_obj( struct process *process, obj_handle_t handle,
                                       unsigned int access, const struct object_ops *ops );
+extern struct hybrid_server_object *get_handle_hybrid_obj( struct process *process,
+                                                           obj_handle_t handle,
+                                                           unsigned int access );
 extern unsigned int get_handle_access( struct process *process, obj_handle_t handle );
 extern obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, struct process *dst,
                                       unsigned int access, unsigned int attr, unsigned int options );

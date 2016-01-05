@@ -444,6 +444,35 @@ struct object *get_handle_obj( struct process *process, obj_handle_t handle,
     return grab_object( obj );
 }
 
+/* retrieve the hybrid_server_object corresponding to a handle, incrementing its refcount */
+struct hybrid_server_object *get_handle_hybrid_obj( struct process *process,
+                                                    obj_handle_t handle,
+                                                    unsigned int access )
+{
+    struct handle_entry *entry;
+    struct object *obj;
+
+    if (!(entry = get_handle( process, handle )))
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return NULL;
+    }
+    obj = entry->ptr;
+
+    if (!type_is_hybrid_object(obj))
+    {
+        set_error( STATUS_OBJECT_TYPE_MISMATCH );  /* not the right type */
+        return NULL;
+    }
+    if ((entry->access & access) != access)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return NULL;
+    }
+
+    return (struct hybrid_server_object *)grab_object( obj );
+}
+
 /* retrieve the access rights of a given handle */
 unsigned int get_handle_access( struct process *process, obj_handle_t handle )
 {
