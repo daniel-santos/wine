@@ -1053,35 +1053,45 @@ static inline BOOL experimental_SHARED_MEMORY( void )
  *
  * Get address of a shared memory block.
  */
-void *server_get_shared_memory( HANDLE thread )
+static NTSTATUS server_get_shared_memory( HANDLE thread, void **ptr_ptr )
 {
     static shmglobal_t *shmglobal = (void *)-1;
-    void *mem = NULL;
     int fd = -1;
+    NTSTATUS ret;
 
     if (!experimental_SHARED_MEMORY())
-        return NULL;
-
+    {
+        *ptr_ptr = NULL;
+        return STATUS_NOT_SUPPORTED;
+    }
     /* The global memory block is only requested once. No locking is
      * required because this function is called very early during the
      * process initialization for the first time. */
     if (!thread && shmglobal != (void *)-1)
-        return shmglobal;
+    {
+        *ptr_ptr = shmglobal;
+        return STATUS_SUCCESS;
+    }
 
-    if (!server_get_shared_memory_fd( thread, &fd ))
+    if (!(ret = server_get_shared_memory_fd( thread, NULL, &fd, NULL )))
     {
         SIZE_T size = thread ? sizeof(shmlocal_t) : sizeof(shmglobal_t);
-        virtual_map_shared_memory( fd, &mem, 0, &size, PAGE_READONLY );
+
+        virtual_map_shared_memory( fd, ptr_ptr, 0, &size, PAGE_READONLY );
         close( fd );
     }
+    else
+        ERR("server_get_shared_memory_fd failed with %08x\n", ret);
 
     if (!thread)
     {
-        if (mem) WARN_(winediag)("Using shared memory wineserver communication\n");
-        shmglobal = mem;
+        if (*ptr_ptr) WARN_(winediag)("Using shared memory wineserver communication\n");
+        shmglobal = *ptr_ptr;
     }
 
-    return mem;
+    return ret;
+}
+
 }
 
 
