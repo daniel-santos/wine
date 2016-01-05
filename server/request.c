@@ -231,7 +231,7 @@ static void send_reply( union generic_reply *reply )
 }
 
 /* call a request handler */
-static void call_req_handler( struct thread *thread )
+static void call_req_handler( struct thread *thread, int async )
 {
     union generic_reply reply;
     enum request req = thread->req.request_header.req;
@@ -244,7 +244,7 @@ static void call_req_handler( struct thread *thread )
     if (debug_level) trace_request();
 
     if (req < REQ_NB_REQUESTS)
-        req_handlers[req]( &current->req, &reply );
+        req_handlers[req]( &current->req, async ? NULL : &reply );
     else
         set_error( STATUS_NOT_IMPLEMENTED );
 
@@ -252,10 +252,13 @@ static void call_req_handler( struct thread *thread )
     {
         if (current->reply_fd)
         {
-            reply.reply_header.error = current->error;
-            reply.reply_header.reply_size = current->reply_size;
-            if (debug_level) trace_reply( req, &reply );
-            send_reply( &reply );
+            if (!async)
+            {
+                reply.reply_header.error = current->error;
+                reply.reply_header.reply_size = current->reply_size;
+                if (debug_level) trace_reply( req, &reply );
+                send_reply( &reply );
+            }
         }
         else
         {
@@ -270,15 +273,19 @@ static void call_req_handler( struct thread *thread )
 void read_request( struct thread *thread )
 {
     int ret;
+    int async = 0;
 
     if (!thread->req_toread)  /* no pending request */
     {
         if ((ret = read( get_unix_fd( thread->request_fd ), &thread->req,
                          sizeof(thread->req) )) != sizeof(thread->req)) goto error;
+
+        if (thread->req.request_header.reply_size & SERVER_REQUEST_REPLY_SIZE_POST)
+            async = 1;
         if (!(thread->req_toread = thread->req.request_header.request_size))
         {
             /* no data, handle request at once */
-            call_req_handler( thread );
+            call_req_handler( thread, async );
             return;
         }
         if (!(thread->req_data = malloc( thread->req_toread )))
@@ -299,7 +306,7 @@ void read_request( struct thread *thread )
         if (ret <= 0) break;
         if (!(thread->req_toread -= ret))
         {
-            call_req_handler( thread );
+            call_req_handler( thread, async );
             free( thread->req_data );
             thread->req_data = NULL;
             return;

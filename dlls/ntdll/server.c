@@ -313,6 +313,38 @@ unsigned int wine_server_call( void *req_ptr )
     return ret;
 }
 
+/***********************************************************************
+ *           wine_server_post (NTDLL.@)
+ *
+ * Post a messages asynchronously to the server.
+ *
+ * PARAMS
+ *     req_ptr [I/O] Function dependent data
+ *
+ * RETURNS
+ *      SUCCESS: STATUS_SUCCESS
+ *
+ * NOTES
+ *     This function is like wine_server_call() except that the calling thread
+ *     does not block or receive a response.
+ */
+
+/* FIXME: make sure that it isn't possible for a thread to post a message and
+ * then exit -- and the server delete that thread data prior to processing the
+ * message attached to that thread */
+unsigned int wine_server_post( void *req_ptr )
+{
+    struct __server_request_info * const req = req_ptr;
+    sigset_t old_set;
+    unsigned int ret;
+
+    req->u.req.request_header.reply_size = SERVER_REQUEST_REPLY_SIZE_POST;
+
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
+    ret = send_request( req );
+    pthread_sigmask( SIG_SETMASK, &old_set, NULL );
+    return ret;
+}
 
 /***********************************************************************
  *           server_enter_uninterrupted_section

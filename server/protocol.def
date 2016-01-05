@@ -53,6 +53,8 @@ struct request_header
     data_size_t  reply_size;   /* reply variable part maximum size */
 };
 
+#define SERVER_REQUEST_REPLY_SIZE_POST  ((data_size_t)0x80000000)
+
 struct reply_header
 {
     unsigned int error;        /* error result */
