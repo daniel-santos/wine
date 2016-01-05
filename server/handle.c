@@ -35,6 +35,7 @@
 
 #include "handle.h"
 #include "process.h"
+#include "process_group.h"
 #include "thread.h"
 #include "security.h"
 #include "request.h"
@@ -259,6 +260,11 @@ static obj_handle_t alloc_handle_entry( struct process *process, void *ptr,
     if (!process->handles)
     {
         set_error( STATUS_PROCESS_IS_TERMINATING );
+        return 0;
+    }
+    if (object_is_shared( obj ) && process_group_manage_object( ptr, process, 0, FALSE, PG_EVENT_ACCESS ))
+    {
+        assert( get_error() );
         return 0;
     }
     return alloc_entry( process->handles, obj, access );
