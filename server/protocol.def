@@ -1120,6 +1120,9 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     VARARG(objattr,object_attributes); /* object attributes */
 @REPLY
     obj_handle_t handle;        /* handle to the semaphore */
+    unsigned int flags;         /* struct hybrid_sync_object::flags_refcount & 1 */
+    client_ptr_t shm_id;        /* unique id for the shared memory block */
+    unsigned int offset;        /* offset from start of shared memory to the object */
 @END
 
 
@@ -1146,6 +1149,10 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     VARARG(name,unicode_str);   /* object name */
 @REPLY
     obj_handle_t handle;        /* handle to the semaphore */
+    unsigned int flags;         /* struct hybrid_sync_object::flags_refcount & 1 */
+    client_ptr_t shm_id;        /* unique id for the shared memory block */
+    unsigned int offset;        /* offset from start of shared memory to the object */
+    unsigned int max;           /* max value */
 @END
 
 
