@@ -1101,8 +1101,60 @@ static NTSTATUS server_get_shared_memory( HANDLE thread, void **ptr_ptr )
     return ret;
 }
 
-}
+/***********************************************************************
+ *           server_get_object_shared_memory
+ *
+ * Get (new or updated) shared object memory from server.
+ *
+ * PARAMS
+ *     obj     [I]  Handle to the object
+ *     info    [IO] See below
+ *
+ * The input should populate info->shm_id with the unique id for the shared memory (provided by the
+ * server) if known. If info->shm_id is != -1 then the offset should also be supplied. The output
+ * will populate shm_id and offset if not known and will always populate info->ptr if the call
+ * succeeds.
+ *
+ * If failure occurs, info is not changed.
+ *
+ * TODO: consolidate with server_get_shared_memory?
+ */
+NTSTATUS server_get_object_shared_memory( HANDLE obj, struct shm_object_info *info )
+{
+    const unsigned int vprot = VPROT_READ | VPROT_WRITE | VPROT_COMMITTED;
+    NTSTATUS ret;
 
+    if (!have_shm_sync())
+        return STATUS_NOT_SUPPORTED;
+
+    if (info->shm_id)
+    {
+        /* first see if this shm_id is already known and mapped */
+        info->fd = -1;
+        ret = virtual_get_shared_memory( NULL, info, vprot);
+
+        if (!ret)
+            goto done;
+
+        /* success or error returns, but if not found, we proceed */
+        if (ret != STATUS_NOT_FOUND)
+            return ret;
+    }
+
+    /* otherwise, request a local fd */
+    ret = server_get_shared_memory_fd( NULL, obj, &info->fd, info );
+    if (ret)
+        return ret;
+
+    ret = virtual_get_shared_memory( NULL, info, vprot );
+    close( info->fd );
+
+    if (ret)
+        return ret;
+
+done:
+    return STATUS_SUCCESS;
+}
 
 /***********************************************************************
  *           wine_server_fd_to_handle   (NTDLL.@)
