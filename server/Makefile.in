@@ -26,6 +26,7 @@ C_SRCS = \
 	object.c \
 	pretty_dump.c \
 	process.c \
+	process_group.c \
 	procfs.c \
 	ptrace.c \
 	queue.c \
