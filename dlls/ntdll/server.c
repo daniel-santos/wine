@@ -1804,8 +1804,19 @@ size_t server_init_thread( void *entry_point )
     SERVER_END_REQ;
 
     /* initialize thread shared memory pointers */
-    NtCurrentTeb()->Reserved5[0] = server_get_shared_memory( 0 );
-    NtCurrentTeb()->Reserved5[1] = server_get_shared_memory( NtCurrentTeb()->ClientId.UniqueThread );
+    if (!ret)
+    {
+        ret = server_get_shared_memory( 0, &NtCurrentTeb()->Reserved5[0] );
+        if (ret == STATUS_NOT_SUPPORTED)
+            ret = STATUS_SUCCESS;
+    }
+
+    if (!ret)
+    {
+        ret = server_get_shared_memory( NtCurrentTeb()->ClientId.UniqueThread, &NtCurrentTeb()->Reserved5[1] );
+        if (ret == STATUS_NOT_SUPPORTED)
+            ret = STATUS_SUCCESS;
+    }
 
     is_wow64 = !is_win64 && (server_cpus & ((1 << CPU_x86_64) | (1 << CPU_ARM64))) != 0;
     ntdll_get_thread_data()->wow64_redir = is_wow64;
