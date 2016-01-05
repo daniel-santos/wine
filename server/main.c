@@ -38,9 +38,14 @@
 #include "request.h"
 #include "wine/library.h"
 
+#ifdef DEBUG
+# include "shm_slab.h"
+#endif
+
 /* command-line options */
 int debug_level = 0;
 int foreground = 0;
+int run_tests = 0;
 timeout_t master_socket_timeout = 3 * -TICKS_PER_SEC;  /* master socket timeout, default is 3 seconds */
 const char *server_argv0;
 
@@ -57,6 +62,9 @@ static void usage( FILE *fh )
     fprintf(fh, "   -p[n], --persistent[=n]  make server persistent, optionally for n seconds\n");
     fprintf(fh, "   -v,    --version         display version information and exit\n");
     fprintf(fh, "   -w,    --wait            wait until the current wineserver terminates\n");
+#ifdef DEBUG
+    fprintf(fh, "   -t,    --tests           run tests\n");
+#endif
     fprintf(fh, "\n");
 }
 
@@ -73,12 +81,15 @@ static void parse_args( int argc, char *argv[] )
         {"persistent",  2, NULL, 'p'},
         {"version",     0, NULL, 'v'},
         {"wait",        0, NULL, 'w'},
+#ifdef DEBUG
+        {"tests",       0, NULL, 't'},
+#endif
         { NULL,         0, NULL, 0}
     };
 
     server_argv0 = argv[0];
 
-    while ((optc = getopt_long( argc, argv, "d::fhk::p::vw", long_options, NULL )) != -1)
+    while ((optc = getopt_long( argc, argv, "d::fhk::p::vwt", long_options, NULL )) != -1)
     {
         switch(optc)
         {
@@ -113,12 +124,78 @@ static void parse_args( int argc, char *argv[] )
             case 'w':
                 wait_for_lock();
                 exit(0);
+            case 't':
+#ifdef DEBUG
+                run_tests = 1;
+                break;
+#endif
             default:
                 usage(stderr);
                 exit(1);
         }
     }
 }
+#undef DEBUG
+#ifdef DEBUG
+static int run_shitty_tests( int argc, char *argv[] )
+{
+    const int flags = SHM_CACHE_POISON | SHM_CACHE_PAD | SHM_CACHE_VERIFY_MEM;
+    struct shm_cache *c = shm_cache_alloc(256, 1, flags);
+    int obj;
+    size_t i;
+    unsigned char *p;
+
+    if (!c)
+    {
+        fprintf(stderr, "shm_cache_alloc failed with %08x\n", get_error());
+        exit(1);
+    }
+    for (i = 0; i < 6; ++i)
+    {
+        obj = shm_cache_alloc_obj(c, NULL);
+        if (obj == -1)
+        {
+            fprintf(stderr, "obj = %d last_error = %08x\n", obj, get_error());
+            exit(1);
+        }
+        fprintf(stderr, "obj=%d, p = %p\n", obj, shm_cache_obj_ptr(c, obj));
+    }
+
+    __shm_cache_verify(c, 3, __shm_cache_obj_ptr(c, 3));
+    shm_cache_dump(c);
+    return 0;
+
+    //shm_cache_free_obj(c, 2);
+    //fprintf(stderr, "\n\nshm_cache_free_obj(2)\n\n");
+
+    fprintf(stderr, "\n\n");
+
+    p = shm_cache_obj_ptr(c, 3);
+    shm_cache_free_obj(c, 3);
+    p[0] = 0xff;
+    p[1] = 0xff;
+    p[2] = 0xff;
+    p[3] = 0xff;
+    fprintf(stderr, "just fucked up %p\n", p);
+    shm_cache_alloc_obj(c, NULL);
+    exit(1);
+
+    __shm_cache_verify(c, 3, __shm_cache_obj_ptr(c, 3));
+    shm_cache_dump(c);
+    shm_cache_alloc_obj(c, NULL);
+
+
+    exit(0);
+    for (i = 0; i < 78; ++i)
+    {
+        obj = shm_cache_alloc_obj(c, NULL);
+        fprintf(stderr, "obj=%d, p = %p\n", obj, shm_cache_obj_ptr(c, obj));
+    }
+
+    return 0;
+}
+
+#endif
 
 static void sigterm_handler( int signum )
 {
@@ -129,6 +206,11 @@ int main( int argc, char *argv[] )
 {
     setvbuf( stderr, NULL, _IOLBF, 0 );
     parse_args( argc, argv );
+
+#ifdef DEBUG
+    if (run_tests)
+        return run_shitty_tests( argc, argv );
+#endif
 
     /* setup temporary handlers before the real signal initialization is done */
     signal( SIGPIPE, SIG_IGN );
