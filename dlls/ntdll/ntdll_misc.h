@@ -28,6 +28,10 @@
 #include "winnt.h"
 #include "winternl.h"
 #include "wine/server.h"
+#include "wine/rbtree.h"
+#include "wine/list.h"
+#define SYNC_H_ATTR DECLSPEC_HIDDEN
+#include "wine/sync.h"
 
 #define MAX_NT_PATH_LENGTH 277
 
@@ -270,5 +274,66 @@ extern HANDLE keyed_event DECLSPEC_HIDDEN;
 #define HASH_STRING_ALGORITHM_INVALID  0xffffffff
 
 NTSTATUS WINAPI RtlHashUnicodeString(PCUNICODE_STRING,BOOLEAN,ULONG,ULONG*);
+
+/* TODO: trim list down to what we're actually going to do client-side */
+enum ntdll_obj_type_id {
+    NTDLL_OBJ_TYPE_ID_ASYNC,                       /* async I/O */
+    NTDLL_OBJ_TYPE_ID_EVENT,                       /* event */
+    NTDLL_OBJ_TYPE_ID_COMPLETION,                  /* IO completion ports */
+    NTDLL_OBJ_TYPE_ID_FILE,                        /* file */
+    NTDLL_OBJ_TYPE_ID_MAILSLOT,                    /* +2 chain mail slot */
+    NTDLL_OBJ_TYPE_ID_MUTEX,                       /* mutex */
+    NTDLL_OBJ_TYPE_ID_MSG_QUEUE,                   /* message queue */
+    NTDLL_OBJ_TYPE_ID_PROCESS,                     /* process */
+    NTDLL_OBJ_TYPE_ID_SEMAPHORE,                   /* semaphore */
+    NTDLL_OBJ_TYPE_ID_THREAD,                      /* thread */
+    NTDLL_OBJ_TYPE_ID_WAITABLE_TIMER,              /* waitable timer */
+
+    NTDLL_OBJ_TYPE_ID_MAX
+};
+
+struct ntdll_object;
+
+struct ntdll_object_type {
+    enum ntdll_obj_type_id id;
+    /* wait on the object */
+    NTSTATUS            (*wait)        (struct ntdll_object *obj, timeout_t timeout);
+    /* attempt to obtain lock on object, return STATUS_SUCCESS or STATUS_WAS_LOCKED upon failure. */
+    NTSTATUS            (*trywait)     (struct ntdll_object *obj);
+    /* close the client-side object */
+    void                (*close)       (struct ntdll_object *obj);
+    /* Dump a description of the object to the supplied buffer. The implementation should
+     * generally call ntdll_object_dump_base() to describe it's struct ntdll_object member.*/
+    void                (*dump)        (const struct ntdll_object *obj, char **start, const char *const end);
+};
+
+/* process-local data for ntdll objects
+ *
+ * If is possible to have more than one ntdll_object representing the same logical object via
+ * DuplicateHandle, OpenXxxx, etc -- even in the same process. When the object is client-private,
+ * subsequent
+ *
+ *
+ */
+struct ntdll_object {
+    struct ntdll_object_type   *type;       /* type */
+    union hybrid_object_any     any;
+    HANDLE                      h;          /* handle to the object (may be more than one handle to the same server-side obj) */
+    struct wine_rb_entry        tree_entry; /* red-black tree node for handle database */
+    struct list                 list_entry;
+};
+
+extern NTSTATUS              ntdll_object_db_init(void) DECLSPEC_HIDDEN;
+extern NTSTATUS              ntdll_object_new(struct ntdll_object **dest, const HANDLE h, size_t size,
+                                              struct ntdll_object_type *type,
+                                              struct shm_object_info *info_ptr) DECLSPEC_HIDDEN;
+extern NTSTATUS __must_check ntdll_object_grab(struct ntdll_object *obj) DECLSPEC_HIDDEN;
+extern NTSTATUS __must_check ntdll_object_release(struct ntdll_object *obj) DECLSPEC_HIDDEN;
+extern void                  ntdll_object_dump_base(const struct ntdll_object *obj, char **start,
+                                                    const char *const end) DECLSPEC_HIDDEN;
+extern const char           *ntdll_object_dump(const struct ntdll_object *obj) DECLSPEC_HIDDEN;
+extern NTSTATUS              ntdll_handle_add(struct ntdll_object *obj) DECLSPEC_HIDDEN;
+extern NTSTATUS              ntdll_handle_remove(const HANDLE h) DECLSPEC_HIDDEN;
+extern struct ntdll_object  *ntdll_handle_find(const HANDLE h) DECLSPEC_HIDDEN;
 
 #endif

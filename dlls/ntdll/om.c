@@ -390,6 +390,8 @@ NTSTATUS close_handle( HANDLE handle )
     }
     SERVER_END_REQ;
     if (fd != -1) close( fd );
+
+    ntdll_handle_remove( handle );
     return ret;
 }
 
