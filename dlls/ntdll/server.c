@@ -1009,7 +1009,7 @@ done:
  *
  * Receive a file descriptor to a server shared memory block.
  */
-static int server_get_shared_memory_fd( HANDLE thread, int *unix_fd )
+static int server_get_shared_memory_fd( HANDLE thread, HANDLE obj, int *fd_ptr, struct shm_object_info *info )
 {
     obj_handle_t dummy;
     sigset_t sigset;
@@ -1019,11 +1019,20 @@ static int server_get_shared_memory_fd( HANDLE thread, int *unix_fd )
 
     SERVER_START_REQ( get_shared_memory )
     {
-        req->tid = HandleToULong(thread);
+        req->tid    = HandleToULong(thread);
+        req->handle = HandleToULong(obj);
         if (!(ret = wine_server_call( req )))
         {
-            *unix_fd = receive_fd( &dummy );
-            if (*unix_fd == -1) ret = STATUS_NOT_SUPPORTED;
+            *fd_ptr = receive_fd( &dummy );
+            if (info)
+            {
+                info->flags  = 0;
+                info->shm_id = reply->shm_id;
+                info->offset = reply->offset;
+                info->size   = reply->size;
+                info->fd     = *fd_ptr;
+            }
+            if (*fd_ptr == -1) ret = STATUS_NOT_SUPPORTED;
         }
     }
     SERVER_END_REQ;
