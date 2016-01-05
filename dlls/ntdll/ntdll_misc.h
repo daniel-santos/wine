@@ -336,4 +336,10 @@ extern NTSTATUS              ntdll_handle_add(struct ntdll_object *obj) DECLSPEC
 extern NTSTATUS              ntdll_handle_remove(const HANDLE h) DECLSPEC_HIDDEN;
 extern struct ntdll_object  *ntdll_handle_find(const HANDLE h) DECLSPEC_HIDDEN;
 
+extern int shm_sync_enabled;
+static inline int have_shm_sync(void)
+{
+    return shm_sync_enabled;
+}
+
 #endif
