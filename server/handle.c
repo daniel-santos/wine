@@ -418,6 +418,7 @@ struct object *get_handle_obj( struct process *process, obj_handle_t handle,
 {
     struct handle_entry *entry;
     struct object *obj;
+    int check_access = 0;
 
     if (!(obj = get_magic_handle( handle )))
     {
@@ -426,23 +427,20 @@ struct object *get_handle_obj( struct process *process, obj_handle_t handle,
             set_error( STATUS_INVALID_HANDLE );
             return NULL;
         }
-        obj = entry->ptr;
-        if (ops && (obj->ops != ops))
-        {
-            set_error( STATUS_OBJECT_TYPE_MISMATCH );  /* not the right type */
-            return NULL;
-        }
-        if ((entry->access & access) != access)
-        {
-            set_error( STATUS_ACCESS_DENIED );
-            return NULL;
-        }
+        obj          = entry->ptr;
+        check_access = 1;
     }
-    else if (ops && (obj->ops != ops))
+    if (ops && (obj->ops != ops))
     {
         set_error( STATUS_OBJECT_TYPE_MISMATCH );  /* not the right type */
         return NULL;
     }
+    if (check_access && (entry->access & access) != access)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return NULL;
+    }
+
     return grab_object( obj );
 }
 
