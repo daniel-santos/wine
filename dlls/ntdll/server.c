@@ -84,6 +84,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(server);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
+WINE_DECLARE_DEBUG_CHANNEL(ntdllsync);
 
 /* Some versions of glibc don't define this */
 #ifndef SCM_RIGHTS
@@ -626,6 +627,120 @@ unsigned int server_select( const select_op_t *select_op, data_size_t size, UINT
     timeout_t abs_timeout = timeout ? timeout->QuadPart : TIMEOUT_INFINITE;
 
     memset( &result, 0, sizeof(result) );
+
+    /* TODO: need to make sure that handles array doesn't contain any duplicates or it could mess up hybrid sync */
+#define ENABLE_HYBRID_SYNC
+#ifdef ENABLE_HYBRID_SYNC
+    TRACE_(ntdllsync)("select_op = %p, size = %u, flags = 0x%x, timeout = %p (%lld)\n",
+                       select_op, size, flags, timeout, (timeout ? (long long)timeout->QuadPart : 0LL));
+
+    /* bWaitAll = FALSE */
+    if (select_op && (select_op->op == SELECT_WAIT || select_op->op == SELECT_WAIT_ALL))
+    {
+        struct ntdll_object *objs[MAXIMUM_WAIT_OBJECTS];
+        size_t nb_locally_lockable_objs = 0;
+        size_t nb_handles = (size - offsetof( select_op_t, wait.handles ))
+                            / sizeof(select_op->wait.handles[0]);
+        ssize_t i;
+        NTSTATUS res;
+        ssize_t wait_object = 0;
+        int do_server_call = 1;
+
+        ret = STATUS_UNSUCCESSFUL;
+
+        /* count the number of locally lockable objects & cache their pointers */
+        for (i = 0; i < nb_handles; ++i)
+        {
+            HANDLE h = wine_server_ptr_handle( select_op->wait.handles[i] );
+            if ((objs[i] = ntdll_handle_find( h )))
+            {
+                /* omit server-private objects */
+                if (hybrid_object_is_server_private( &objs[i]->any.ho ))
+                {
+                    res = ntdll_object_release( objs[i] );
+                    if (res)
+                        ret = res;
+                    objs[i] = NULL;
+                }
+                else
+                    ++nb_locally_lockable_objs;
+            }
+        }
+
+        TRACE_(ntdllsync)("%zd/%zd objects are locally selectable, need %s.\n",
+                          nb_locally_lockable_objs, nb_handles,
+                          (select_op->op == SELECT_WAIT ? "any" : "all"));
+
+        /* FIXME: will not properly respond to a signal (ignores them) or call an APC */
+        /* with a single object, we call wait in-client */
+        if (nb_handles == 1 && nb_locally_lockable_objs)
+        {
+//fprintf(stderr, "%s: doing wait\n", __func__);
+            ret = objs[0]->type->wait(objs[0], abs_timeout);
+            goto local_done;
+        }
+
+        /* send wait multiple (bWaitAll = TRUE) and non-local objects to server. */
+        if (select_op->op == SELECT_WAIT_ALL || !nb_locally_lockable_objs)
+            goto local_done;
+
+        /* WaitForMultipleObjectsEx with bWaitAll = FALSE must go in order */
+        for (i = 0; i < nb_handles; ++i)
+        {
+            /* If we can't wait on this one locally, we must do the server call */
+            if (!objs[i])
+                break;
+
+            res = objs[i]->type->trywait(objs[i]);
+            if (res == STATUS_SUCCESS)
+            {
+                TRACE_(ntdllsync)("Successful local wait any. obj = %p (h = %p)\n", objs[i], objs[i]->h);
+
+                ret = STATUS_SUCCESS;
+                wait_object = i;
+                break;
+            }
+            else if (res == STATUS_WAS_LOCKED)
+                continue;
+            else
+                ret = res;
+        }
+
+local_done:
+
+        switch (ret)
+        {
+        case STATUS_SUCCESS:
+            ret = WAIT_OBJECT_0 + wait_object;
+            /* intentional fall-through */
+
+        case WAIT_ABANDONED:
+        case WAIT_TIMEOUT:
+            do_server_call = 0;
+            break;
+        }
+
+        /* release any objects we've grabbed */
+        for (i = 0; i < nb_handles; ++i)
+        {
+            struct ntdll_object *obj = objs[i];
+
+            if (obj)
+            {
+                res = ntdll_object_release(obj);
+                if (!ret)
+                    ret = res;
+            }
+        }
+        if (!do_server_call)
+            return ret;
+    }
+
+#endif /* ENABLE_HYBRID_SYNC */
+
+    if (TRACE_ON(ntdllsync) && select_op && (select_op->op == SELECT_WAIT
+                                          || select_op->op == SELECT_WAIT_ALL))
+        TRACE_(ntdllsync)("Doing server call.\n");
 
     for (;;)
     {
