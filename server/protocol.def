@@ -74,6 +74,7 @@ typedef struct
 {
     unsigned int last_input_time;       /* last input time */
     unsigned int foreground_wnd_epoch;  /* counter to invalidate foreground window */
+    unsigned int last_server_cpu;       /* the last cpu the server ran on */
 } shmglobal_t;
 
 /* wineserver local shared memory block */
