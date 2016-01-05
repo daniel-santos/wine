@@ -1780,3 +1780,14 @@ DECL_HANDLER(get_selector_entry)
         release_object( thread );
     }
 }
+
+DECL_HANDLER(notify_signaled)
+{
+    struct hybrid_server_object *hso = get_handle_hybrid_obj( current->process, req->handle, 0 );
+
+    if (hso)
+    {
+        wake_up( &hso->obj, 0 );
+        release_object( &hso->obj );
+    }
+}

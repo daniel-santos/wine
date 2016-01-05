@@ -3723,3 +3723,9 @@ struct handle_info
     obj_handle_t handle;          /* handle to the job */
     int          status;          /* process exit code */
 @END
+
+
+/* Notify server that an object is signaled */
+@REQ(notify_signaled)
+    obj_handle_t handle;          /* handle to the object */
+@END

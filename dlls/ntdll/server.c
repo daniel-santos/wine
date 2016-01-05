@@ -1649,3 +1649,17 @@ size_t server_init_thread( void *entry_point )
         server_protocol_error( "init_thread failed with status %x\n", ret );
     }
 }
+
+NTSTATUS server_notify_signaled( HANDLE obj )
+{
+    NTSTATUS ret;
+
+    SERVER_START_REQ( notify_signaled )
+    {
+        req->handle = HandleToULong( obj );
+        ret = wine_server_post( req );
+    }
+    SERVER_END_REQ;
+
+    return ret;
+}
