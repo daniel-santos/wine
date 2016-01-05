@@ -1222,7 +1222,12 @@ enum server_fd_type
 
 /* Get file descriptor for shared memory */
 @REQ(get_shared_memory)
-    thread_id_t tid;            /* thread id or 0 */
+    thread_id_t  tid;           /* thread id or 0 */
+    obj_handle_t handle;        /* handle to object or NULL */
+@REPLY
+    client_ptr_t shm_id;        /* id for the current shared memory block object resides in */
+    unsigned int offset;        /* offset from start of shared memory to the object */
+    unsigned int size;          /* size of the shared memory region */
 @END
 
 
