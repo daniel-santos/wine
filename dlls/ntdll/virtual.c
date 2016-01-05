@@ -41,6 +41,7 @@
 #ifdef HAVE_VALGRIND_VALGRIND_H
 # include <valgrind/valgrind.h>
 #endif
+#include <limits.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -2727,6 +2728,7 @@ done:
     return res;
 }
 
+/* TODO: consolidate with virtual_get_shared_memory? */
 
 /***********************************************************************
  *           virtual_map_shared_memory
@@ -3035,4 +3037,284 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
 
     server_leave_uninterrupted_section( &csVirtual, &sigset );
     return status;
+}
+
+
+static struct list shared_memory_blocks = LIST_INIT(shared_memory_blocks);
+struct shared_memory_block
+{
+    struct list         entry;
+    __int64             id;            /* unique id for shared memory block (key for lookups) */
+    int                 refcount;
+    struct file_view   *view;
+};
+
+
+/***********************************************************************
+ *           map_shared_memory
+ *
+ * Map shared memory into the process address space.
+ *
+ * PARAMS
+ *      view_ptr   [O] Buffer to receive pointer to new struct file_view object
+ *      fd         [I]  File descriptor
+ *      addr       [I] Suggested address
+ *      align_mask [I] Mask for required alignment
+ *      pages      [I] Size in pages
+ *      vprot      [I] vprot protection flags
+ *
+ * RETURNS
+ *      Success: STATUS_SUCCESS
+ *      Failure: an error code;
+ */
+static NTSTATUS map_shared_memory( struct file_view **view_ptr, int fd, void *addr,
+                                   size_t align_mask, size_t pages, unsigned int vprot )
+{
+    sigset_t sigset;
+    NTSTATUS res;
+    const size_t size = pages << page_shift;
+
+    server_enter_uninterrupted_section( &csVirtual, &sigset );
+//align_mask=0xffff;
+
+//fprintf(stderr, "%s(%p, %d, %p, %08zx, %zu, %08x)\n", __func__, view_ptr, fd, addr, align_mask, pages, vprot);
+//fprintf(stderr, "%s: map_view(%p, %p, %zu, 0x%zx, %d, %08x)\n", __func__, view_ptr, addr, size, align_mask, FALSE, vprot );
+
+    res = map_view( view_ptr, addr, size, align_mask, FALSE, vprot );
+    if (!res)
+    {
+        /* Map the shared memory */
+
+        struct file_view *view = *view_ptr;
+        int prot;
+
+        prot = VIRTUAL_GetUnixProt( vprot );
+        if (force_exec_prot && !(vprot & VPROT_NOEXEC) && (vprot & VPROT_READ))
+        {
+            TRACE( "forcing exec permission on mapping %p-%p\n",
+                   (char *)view->base, (char *)view->base + size - 1 );
+            prot |= PROT_EXEC;
+        }
+
+//prot = 1;
+//fprintf(stderr, "%s: mmap(%p, %zu, %08x, %08x, %d, 0)\n", __func__, view->base, size, prot, MAP_FIXED | MAP_SHARED, fd);
+
+        if (mmap( view->base, size, prot, MAP_FIXED | MAP_SHARED, fd, 0 ) != (void *)-1)
+            memset( view->prot, vprot, pages );
+        else
+        {
+            perror( "mmap" );
+            ERR( "mmap failed addr = %p, fd = 0x%02x, size = 0x%zx\n", view->base, fd, size );
+            delete_view( view );
+            /* FIXME: set res to something more appropriate */
+            res = STATUS_NONE_MAPPED;
+        }
+    }
+
+    server_leave_uninterrupted_section( &csVirtual, &sigset );
+    return res;
+}
+
+static void shared_memory_block_dump( struct shared_memory_block *shm )
+{
+    unsigned char fl;
+    fprintf(stderr, "struct shared_memory_block %p = {"
+                    "entry = (.prev = %p, .next = %p), "
+                    "id = %016llx, "
+                    "refcount = %d,"
+                    "view = %p}\n",
+                    shm,
+                    shm->entry.prev, shm->entry.next,
+                    (long long)shm->id,
+                    shm->refcount,
+                    shm->view);
+    fl = __wine_dbch_virtual.flags;
+    __wine_dbch_virtual.flags = 0xff;
+VIRTUAL_DumpView( shm->view );
+    __wine_dbch_virtual.flags = fl;
+#if 1
+    {
+        const size_t               bytes_per_row   = 64;
+        const size_t               bytes_per_group = 4;
+        char                       line_buf[256]   = { 0 };
+        char                      *out             = line_buf;
+        unsigned const char       *p               = shm->view->base;
+        unsigned const char *const end             = p + page_size;
+
+        for (; p < end; ++p)
+        {
+            if (!((size_t)p % bytes_per_row) && *line_buf)
+            {
+                fprintf(stderr, "\n  %s", line_buf);
+                *line_buf = 0;
+            }
+
+            if (!*line_buf)
+            {
+                sprintf(line_buf, "%04lx:", (size_t)p & 0xffffl);
+                out = line_buf + strlen(line_buf);
+            }
+
+            if (!((size_t)p % bytes_per_group))
+                *(out++) = ' ';
+
+            sprintf(out,"%02x", *p);
+            out += 2;
+        }
+        if (*line_buf)
+            fprintf(stderr, "\n  %s", line_buf);
+        fprintf(stderr, "\n\n");
+    }
+#endif
+
+}
+
+
+/***********************************************************************
+ *             virtual_get_shared_object_memory
+ *
+ * Retrieve the shared memory block associated with info->shm_id or create a new one.
+ *
+ * PARAMS
+ * shm_ptr      [O]     (optional) A buffer to receive the struct shared_memory_block pointer.
+ * fd           [I]     Client-side file descriptor if available or -1 if not known.
+ * info         [IO]    See below
+ * vprot        [I]     The VPROT_ flags to use for mapping the file.
+ *
+ * If attempting to retrieve a shared memory block that already exists, only info->shm_id and
+ * info->offset needs to be populated and info->fd should be set to -1. If attempting to
+ * (potentially) create a new struct shared_memory_block, then info->fd should be set to the local
+ * file descriptor, info->size should be set to the size of the file and info->ptr should be set to
+ * either NULL or an address where you want the shared memory mapped to.
+ *
+ * The function first searches the list shared_memory_blocks for a struct shared_memory_block who's
+ * id matches info->shm_id. If a match is found and is of sufficient size, then the buffer pointed
+ * to by shm_ptr is populated (if non-NULL) with the address of the shared_memory_block object and
+ * info->ptr is populated with the address of the start of the shared memory region plus
+ * info->offset.
+ *
+ * If a match is not found and fd != -1, then the function attempts to map the file into memory and
+ * returns the information the same as described above. If fd != -1 and offset is not set or
+ * initialized then a failed assertion will result.
+ *
+ * RETURNS
+ *  STATUS_SUCCESS
+ *  STATUS_NOT_FOUND         A match is not found and fd == -1
+ *  STATUS_INVALID_PARAMETER If the shared memory block is smaller than info->offset +
+ *                           sizeof(union shm_sync_value) in bytes.
+ *  STATUS_NO_MEMORY         Memory allocation failure
+ *  various other errors can return from map_shared_memory(), map_view(), etc.
+ */
+NTSTATUS virtual_get_shared_memory( struct shared_memory_block **shm_ptr,
+                                    struct shm_object_info *info, int vprot )
+{
+    NTSTATUS ret;
+    sigset_t sigset;
+    struct shared_memory_block *i;
+    struct shared_memory_block *shm = NULL;
+    const size_t min_size = info->offset + sizeof(union shm_sync_value);
+
+    assert( info->shm_id );
+
+    server_enter_uninterrupted_section( &csVirtual, &sigset );
+    LIST_FOR_EACH_ENTRY( i, &shared_memory_blocks, struct shared_memory_block, entry )
+    {
+        if (i->id == info->shm_id)
+        {
+            shm = i;
+            assert(shm->refcount > 0);
+            assert(shm->refcount < INT_MAX);
+            ++shm->refcount;
+            break;
+        }
+    }
+    server_leave_uninterrupted_section( &csVirtual, &sigset );
+
+    if (likely(!!shm))
+    {}
+    else
+    {
+        if (info->fd == -1)
+            return STATUS_NOT_FOUND;
+
+//fprintf(stderr, "@@@@@@@@@@ %s: new\n", __func__);
+        assert( info->size >= page_size );
+        assert( !(info->size % page_size) );
+
+        shm = RtlAllocateHeap( virtual_heap, 0, sizeof(*shm) );
+        if (!shm)
+            return STATUS_NO_MEMORY;
+
+        memset(shm, 0, sizeof(*shm));
+        shm->refcount = 1;
+        shm->id       = info->shm_id;
+
+        ret = map_shared_memory( &shm->view, info->fd, info->ptr, page_mask, info->size / page_size, vprot );
+        if (ret)
+        {
+            ERR("map_shared_memory failed with %08x\n", ret);
+            RtlFreeHeap( virtual_heap, 0, shm );
+            return ret;
+        }
+
+        server_enter_uninterrupted_section( &csVirtual, &sigset );
+        list_add_tail(&shared_memory_blocks, &shm->entry);
+        server_leave_uninterrupted_section( &csVirtual, &sigset );
+    }
+
+    if (unlikely(shm->view->size < min_size))
+    {
+        ERR("Wrong size for shared memory area or bad offset (%zu < %zu)\n", shm->view->size, min_size);
+        virtual_release_shared_memory( shm );
+        return STATUS_INVALID_PARAMETER;
+    }
+
+//finished:
+    if (shm_ptr)
+        *shm_ptr  = shm;
+    info->ptr = (char*)shm->view->base + info->offset;
+if (0)
+shared_memory_block_dump( shm );
+
+    return STATUS_SUCCESS;
+}
+
+/* must hold csVirtual prior to call */
+static struct shared_memory_block *find_shm_block( const char *ptr )
+{
+    struct shared_memory_block *i;
+
+    LIST_FOR_EACH_ENTRY( i, &shared_memory_blocks, struct shared_memory_block, entry )
+    {
+        const char *start = i->view->base;
+        const char *end   = start + i->view->size;
+        if (ptr >= start && ptr <= end)
+            return i;
+    }
+
+    return NULL;
+}
+
+void virtual_release_shared_memory( void *addr )
+{
+    struct shared_memory_block *shm;
+    sigset_t sigset;
+
+    server_enter_uninterrupted_section( &csVirtual, &sigset );
+    if ((shm = find_shm_block( addr )))
+    {
+        //--shm->refcount;
+
+//fprintf(stderr, "\n\n###########################%s: %p refcount = %d (ptr = %p)\n", __func__, shm, shm->refcount, addr);
+        assert(shm->refcount >= 0);
+        if (0 && shm->refcount == 0)
+        {
+//fprintf(stderr, "%s: removing %p\n", __func__, shm);
+            list_remove( &shm->entry );
+            unmap_area( shm->view->base, shm->view->size );
+            delete_view( shm->view );
+            RtlFreeHeap( virtual_heap, 0, shm );
+        }
+    }
+    server_leave_uninterrupted_section( &csVirtual, &sigset );
 }

@@ -168,6 +168,7 @@ extern NTSTATUS nt_to_unix_file_name_attr( const OBJECT_ATTRIBUTES *attr, ANSI_S
                                            UINT disposition ) DECLSPEC_HIDDEN;
 
 /* virtual memory */
+struct shared_memory_block;
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info ) DECLSPEC_HIDDEN;
 extern NTSTATUS virtual_create_builtin_view( void *base ) DECLSPEC_HIDDEN;
 extern NTSTATUS virtual_alloc_thread_stack( TEB *teb, SIZE_T reserve_size, SIZE_T commit_size ) DECLSPEC_HIDDEN;
@@ -184,6 +185,9 @@ extern void VIRTUAL_SetForceExec( BOOL enable ) DECLSPEC_HIDDEN;
 extern void virtual_release_address_space(void) DECLSPEC_HIDDEN;
 extern void virtual_set_large_address_space(void) DECLSPEC_HIDDEN;
 extern struct _KUSER_SHARED_DATA *user_shared_data DECLSPEC_HIDDEN;
+extern NTSTATUS virtual_get_shared_memory( struct shared_memory_block **shm_ptr,
+                                           struct shm_object_info *info, int vprot );
+extern void virtual_release_shared_memory( void *addr ) DECLSPEC_HIDDEN;
 
 /* completion */
 extern NTSTATUS NTDLL_AddCompletion( HANDLE hFile, ULONG_PTR CompletionValue,
