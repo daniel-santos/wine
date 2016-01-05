@@ -656,13 +656,58 @@ static int wait_on_handles( const select_op_t *select_op, unsigned int count, co
     return ret;
 }
 
-/* check if the thread waiting condition is satisfied */
-static int check_wait( struct thread *thread )
+#ifdef __GNUC__
+# ifndef __maybe_unused
+#  define __maybe_unused __attribute__((unused))
+# endif
+#endif
+#ifndef __maybe_unused
+# define __maybe_unused
+#endif
+
+static __maybe_unused const char *get_timestamp( void )
 {
-    int i;
+    static char buf[32];
+    struct timeval t;
+
+    gettimeofday( &t, NULL );
+    snprintf( buf, sizeof(buf), "%zu.%06zu", t.tv_sec % 1000, t.tv_usec );
+
+    return buf;
+}
+
+/* returns TRUE if any threads other than the one passed are waiting on this object */
+static int other_waiters( struct object *obj, struct thread *thread )
+{
+    struct wait_queue_entry *i;
+
+    LIST_FOR_EACH_ENTRY(i, &obj->wait_queue, struct wait_queue_entry, entry)
+        if (i->wait != thread->wait)
+            return TRUE;
+
+    return FALSE;
+}
+
+/* check if the thread waiting condition is satisfied */
+static int ___check_wait( struct thread *thread )
+{
+    int i, j;
     struct thread_wait *wait = thread->wait;
     struct wait_queue_entry *entry;
+    NTSTATUS ret = 0;
+    NTSTATUS result;
+    ULONGLONG dupes = 0ull;
 
+    __maybe_unused  const char * const select_op_descr[] = {
+        "SELECT_NONE",
+        "SELECT_WAIT",
+        "SELECT_WAIT_ALL",
+        "SELECT_SIGNAL_AND_WAIT",
+        "SELECT_KEYED_EVENT_WAIT",
+        "SELECT_KEYED_EVENT_RELEASE"
+    };
+
+    /* TODO: need to make sure that handles array doesn't contain any duplicates or it could mess up hybrid sync */
     assert( wait );
 
     if ((wait->flags & SELECT_INTERRUPTIBLE) && !list_empty( &thread->system_apc ))
@@ -671,36 +716,202 @@ static int check_wait( struct thread *thread )
     /* Suspended threads may not acquire locks, but they can run system APCs */
     if (thread->process->suspend + thread->suspend > 0) return -1;
 
-    if (wait->select == SELECT_WAIT_ALL)
+#if 0
+fprintf(stderr, "%s: op=%s, count=%u\n", __func__, select_op_descr[wait->select], wait->count);
+if (wait->select == SELECT_WAIT_ALL || wait->select == SELECT_WAIT) {
+    for (i = 0, entry = wait->queues; i < wait->count; i++, entry++) {
+        fprintf(stderr, "%s %s:     obj[%u]=", get_timestamp(), __func__, i);
+        if (entry->obj->ops->dump)
+            entry->obj->ops->dump(entry->obj, 1);
+        else
+            fprintf(stderr, "(nodump)");
+    }
+}
+#endif
+
+    for (i = 0; i < wait->count; i++)
+        for (j = 0; j < i; ++j)
+            if (wait->queues[j].obj == wait->queues[i].obj)
+            {
+                dupes |= 1ull << i;
+                fprintf(stderr, "dupes %016llx\n", (long long)dupes);
+                break;
+            }
+//dupes=0ull;
+    if (wait->select == SELECT_WAIT_ALL) /* bWaitAll == TRUE */
     {
         int not_ok = 0;
-        /* Note: we must check them all anyway, as some objects may
-         * want to do something when signaled, even if others are not */
+        int have_hybrid_objects = 0;
+        ULONGLONG undo_list = 0;
+
+        assert(MAXIMUM_WAIT_OBJECTS <= sizeof(ULONGLONG) * 8);
+        /* Note: we must check them all anyway, as some objects (msg queues)
+         * may want to do something when signaled, even if others are not */
         for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
-            not_ok |= !entry->obj->ops->signaled( entry->obj, entry );
+        {
+            if (type_is_hybrid_object( entry->obj ))
+                have_hybrid_objects = 1;
+            else
+                not_ok |= !entry->obj->ops->signaled( entry->obj, entry );
+        }
         if (not_ok) goto other_checks;
+
+        if (!have_hybrid_objects)
+            goto do_satisfied;
+
+        if (not_ok) goto other_checks;
+
+        /* all normal objects signaled, try to acquire locks on hybrid objects */
+        for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
+        {
+            if (!type_is_hybrid_object( entry->obj ))
+                continue;
+
+            if (dupes & (1ull << i))
+                continue;
+
+            /* in the case of bWaitAll == TRUE, we're only setting the SHM_SYNC_VALUE_NOTIFY_SVR flag
+             * on the hybrid sync object that fails the test */
+            result = entry->obj->ops->trywait_begin_trans( entry->obj, entry );
+            switch (result) {
+            case STATUS_SUCCESS:
+                undo_list |= 1ull << i;
+                continue;
+            case STATUS_WAS_LOCKED:
+                break;
+            default:
+                ret = result;
+                break;
+            }
+
+            /* if failure then rollback */
+            for (--i, --entry; i >= 0; --i, --entry)
+            {
+                if (undo_list & (1ULL << i))
+                {
+                    result = entry->obj->ops->trywait_rollback( entry->obj );
+                    if (result && !ret)
+                        ret = result;
+                }
+            }
+#if 0
+if (wait->select == SELECT_WAIT_ALL || wait->select == SELECT_WAIT) {
+    for (i = 0, entry = wait->queues; i < wait->count; i++, entry++) {
+        fprintf(stderr, "%s %s:-----obj[%u]=", get_timestamp(), __func__, i);
+        if (entry->obj->ops->dump)
+            entry->obj->ops->dump(entry->obj, 1);
+        else
+            fprintf(stderr, "(nodump)");
+    }
+}
+#endif
+
+            if (ret)
+                return ret;
+            goto other_checks;
+        }
+
+do_satisfied:
         /* Wait satisfied: tell it to all objects */
         for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
-            entry->obj->ops->satisfied( entry->obj, entry );
+        {
+            if (dupes & (1ull << i))
+                continue;
+            if (type_is_hybrid_object( entry->obj ))
+                entry->obj->ops->trywait_commit( entry->obj, !other_waiters( entry->obj, thread ) );
+            if (entry->obj->ops->satisfied)
+                entry->obj->ops->satisfied( entry->obj, entry );
+        }
         return wait->abandoned ? STATUS_ABANDONED_WAIT_0 : STATUS_WAIT_0;
     }
-    else
+    else /* bWaitAll == FALSE */
     {
         for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
         {
-            if (!entry->obj->ops->signaled( entry->obj, entry )) continue;
+            if (dupes & (1ull << i))
+                continue;
+            if (!type_is_hybrid_object( entry->obj ))
+            {
+                if (!entry->obj->ops->signaled( entry->obj, entry ))
+                    continue;
+            }
+            else
+            {
+                result = entry->obj->ops->trywait_begin_trans( entry->obj, entry );
+                switch (result)
+                {
+                case STATUS_WAS_LOCKED:
+                    continue;
+                case STATUS_SUCCESS:
+                    entry->obj->ops->trywait_commit( entry->obj, !other_waiters( entry->obj, thread ) );
+                    break;
+                default:
+                    if (!ret)
+                        ret = result;
+                    goto cleanup_wait_any;
+                }
+            }
+
             /* Wait satisfied: tell it to the object */
-            entry->obj->ops->satisfied( entry->obj, entry );
+            if (entry->obj->ops->satisfied)
+                entry->obj->ops->satisfied( entry->obj, entry );
             if (wait->abandoned) i += STATUS_ABANDONED_WAIT_0;
-            return i;
+
+            /* this is stupid, but right now calling 'commit' on an object who's
+             * trywait_begin_trans returned STATUS_WAS_LOCKED is how we are
+             * telling it that this wait is satisfied, so it can clear the notify
+             * bit if there are no other waiters :( It needs a better name or
+             * definition, but this assures that we either get the signal (on
+             * the server) or that the bit is cleared. */
+            ret = i;
+
+cleanup_wait_any:
+            for (--i, --entry; i >= 0; --i, --entry)
+            {
+                if (dupes & (1ull << i))
+                    continue;
+                if (type_is_hybrid_object( entry->obj ) && !other_waiters( entry->obj, thread ))
+                {
+                    result = hybrid_server_object_clear_notify( (void*)entry->obj );
+                    if (result)
+                        return result;
+                }
+            }
+
+            return ret;
         }
     }
 
  other_checks:
     if ((wait->flags & SELECT_ALERTABLE) && !list_empty(&thread->user_apc)) return STATUS_USER_APC;
-    if (wait->timeout <= current_time) return STATUS_TIMEOUT;
+    if (wait->timeout <= current_time)
+        return STATUS_TIMEOUT;
     return -1;
 }
+
+/* temporary debug wrapper to verify state of hybrid objects */
+static int check_wait( struct thread *thread )
+{
+    struct thread_wait *wait = thread->wait;
+    int result = ___check_wait( thread );
+    int i;
+
+    for (i = 0; i < wait->count; i++)
+    {
+        struct object *obj = wait->queues[i].obj;
+
+        if (type_is_hybrid_object( obj ))
+        {
+            union shm_sync_value value;
+            struct hybrid_server_object *hso = (void*)obj;
+            atomic_read(&value, hso->any.ho.value);
+            assert(! (value.flags_hash & (SHM_SYNC_VALUE_LOCKED | SHM_SYNC_VALUE_MOVED)));
+        }
+    }
+
+    return result;
+}
+
 
 /* send the wakeup signal to a thread */
 static int send_thread_wakeup( struct thread *thread, client_ptr_t cookie, int signaled )
