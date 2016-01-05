@@ -473,6 +473,32 @@ struct hybrid_server_object *get_handle_hybrid_obj( struct process *process,
     return (struct hybrid_server_object *)grab_object( obj );
 }
 
+unsigned int count_handles( const struct object *obj, struct process *process, obj_handle_t exclude )
+{
+    const struct handle_table *const table = process->handles;
+
+    if (!table)
+    {
+        set_error( STATUS_PROCESS_IS_TERMINATING );
+        return 0;
+    }
+    else
+    {
+        const struct handle_entry *const end = &table->entries[table->last + 1];
+        const struct handle_entry *skip = !exclude ? NULL : &table->entries[handle_to_index( exclude )];
+        struct handle_entry *i;
+        unsigned int count = 0;
+
+        assert( skip < end );
+
+        for (i = table->entries; i < end; i++)
+            if (i->ptr == obj && i != skip)
+                ++count;
+
+        return count;
+    }
+}
+
 /* retrieve the access rights of a given handle */
 unsigned int get_handle_access( struct process *process, obj_handle_t handle )
 {
