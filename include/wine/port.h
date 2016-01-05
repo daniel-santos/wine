@@ -573,6 +573,11 @@ static inline void cpu_relax(void)
 #endif
 }
 
+static inline void barrier(void)
+{
+    asm volatile ("" : : : "memory");
+}
+
 /* FIXME: clean up this crappiness */
 #define __int8 char
 #define __int16 short
