@@ -150,6 +150,7 @@ DECL_HANDLER(open_file_object);
 DECL_HANDLER(alloc_file_handle);
 DECL_HANDLER(get_handle_unix_name);
 DECL_HANDLER(get_handle_fd);
+DECL_HANDLER(get_shared_memory);
 DECL_HANDLER(flush);
 DECL_HANDLER(lock_file);
 DECL_HANDLER(unlock_file);
@@ -376,6 +377,7 @@ DECL_HANDLER(process_in_job);
 DECL_HANDLER(set_job_limits);
 DECL_HANDLER(set_job_completion_port);
 DECL_HANDLER(terminate_job);
+DECL_HANDLER(notify_signaled);
 
 #ifdef WANT_REQUEST_HANDLERS
 
@@ -426,6 +428,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_alloc_file_handle,
     (req_handler)req_get_handle_unix_name,
     (req_handler)req_get_handle_fd,
+    (req_handler)req_get_shared_memory,
     (req_handler)req_flush,
     (req_handler)req_lock_file,
     (req_handler)req_unlock_file,
@@ -652,6 +655,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_job_limits,
     (req_handler)req_set_job_completion_port,
     (req_handler)req_terminate_job,
+    (req_handler)req_notify_signaled,
 };
 
 C_ASSERT( sizeof(affinity_t) == 8 );
@@ -921,7 +925,10 @@ C_ASSERT( FIELD_OFFSET(struct create_semaphore_request, initial) == 20 );
 C_ASSERT( FIELD_OFFSET(struct create_semaphore_request, max) == 24 );
 C_ASSERT( sizeof(struct create_semaphore_request) == 32 );
 C_ASSERT( FIELD_OFFSET(struct create_semaphore_reply, handle) == 8 );
-C_ASSERT( sizeof(struct create_semaphore_reply) == 16 );
+C_ASSERT( FIELD_OFFSET(struct create_semaphore_reply, flags) == 12 );
+C_ASSERT( FIELD_OFFSET(struct create_semaphore_reply, shm_id) == 16 );
+C_ASSERT( FIELD_OFFSET(struct create_semaphore_reply, offset) == 24 );
+C_ASSERT( sizeof(struct create_semaphore_reply) == 32 );
 C_ASSERT( FIELD_OFFSET(struct release_semaphore_request, handle) == 12 );
 C_ASSERT( FIELD_OFFSET(struct release_semaphore_request, count) == 16 );
 C_ASSERT( sizeof(struct release_semaphore_request) == 24 );
@@ -937,7 +944,11 @@ C_ASSERT( FIELD_OFFSET(struct open_semaphore_request, attributes) == 16 );
 C_ASSERT( FIELD_OFFSET(struct open_semaphore_request, rootdir) == 20 );
 C_ASSERT( sizeof(struct open_semaphore_request) == 24 );
 C_ASSERT( FIELD_OFFSET(struct open_semaphore_reply, handle) == 8 );
-C_ASSERT( sizeof(struct open_semaphore_reply) == 16 );
+C_ASSERT( FIELD_OFFSET(struct open_semaphore_reply, flags) == 12 );
+C_ASSERT( FIELD_OFFSET(struct open_semaphore_reply, shm_id) == 16 );
+C_ASSERT( FIELD_OFFSET(struct open_semaphore_reply, offset) == 24 );
+C_ASSERT( FIELD_OFFSET(struct open_semaphore_reply, max) == 28 );
+C_ASSERT( sizeof(struct open_semaphore_reply) == 32 );
 C_ASSERT( FIELD_OFFSET(struct create_file_request, access) == 12 );
 C_ASSERT( FIELD_OFFSET(struct create_file_request, attributes) == 16 );
 C_ASSERT( FIELD_OFFSET(struct create_file_request, sharing) == 20 );
@@ -972,6 +983,13 @@ C_ASSERT( FIELD_OFFSET(struct get_handle_fd_reply, cacheable) == 12 );
 C_ASSERT( FIELD_OFFSET(struct get_handle_fd_reply, access) == 16 );
 C_ASSERT( FIELD_OFFSET(struct get_handle_fd_reply, options) == 20 );
 C_ASSERT( sizeof(struct get_handle_fd_reply) == 24 );
+C_ASSERT( FIELD_OFFSET(struct get_shared_memory_request, tid) == 12 );
+C_ASSERT( FIELD_OFFSET(struct get_shared_memory_request, handle) == 16 );
+C_ASSERT( sizeof(struct get_shared_memory_request) == 24 );
+C_ASSERT( FIELD_OFFSET(struct get_shared_memory_reply, shm_id) == 8 );
+C_ASSERT( FIELD_OFFSET(struct get_shared_memory_reply, offset) == 16 );
+C_ASSERT( FIELD_OFFSET(struct get_shared_memory_reply, size) == 20 );
+C_ASSERT( sizeof(struct get_shared_memory_reply) == 24 );
 C_ASSERT( FIELD_OFFSET(struct flush_request, blocking) == 12 );
 C_ASSERT( FIELD_OFFSET(struct flush_request, async) == 16 );
 C_ASSERT( sizeof(struct flush_request) == 56 );
@@ -2299,6 +2317,8 @@ C_ASSERT( sizeof(struct set_job_completion_port_request) == 32 );
 C_ASSERT( FIELD_OFFSET(struct terminate_job_request, handle) == 12 );
 C_ASSERT( FIELD_OFFSET(struct terminate_job_request, status) == 16 );
 C_ASSERT( sizeof(struct terminate_job_request) == 24 );
+C_ASSERT( FIELD_OFFSET(struct notify_signaled_request, handle) == 12 );
+C_ASSERT( sizeof(struct notify_signaled_request) == 16 );
 
 #endif  /* WANT_REQUEST_HANDLERS */
 
