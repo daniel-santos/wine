@@ -120,10 +120,9 @@ struct hybrid_sync_object
 #define HYBRID_SYNC_BAD                 0x08 /* Object is bad */
 #define HYBRID_SYNC_BAD_BIT                3
 #define HYBRID_SYNC_DBG_DOING_MOVE      0x10 /* REMOVE: for debugging race conditions only! */
-#define HYBRID_SYNC_DBG_DOING_MOVE_BIT     4
 
 
-#define HYBRID_SYNC_FLAGS_BITS   5
+#define HYBRID_SYNC_FLAGS_BITS   4
 #define HYBRID_SYNC_FLAGS_MASK   ((1 << HYBRID_SYNC_FLAGS_BITS) - 1)
 #define HYBRID_SYNC_MAX_REFCOUNT (((unsigned int)INT_MAX >> HYBRID_SYNC_FLAGS_BITS) - 1)
 #define HYBRID_SYNC_INIT_MASK   HYBRID_SYNC_SERVER_PRIVATE

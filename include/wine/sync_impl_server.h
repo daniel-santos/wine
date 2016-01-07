@@ -271,10 +271,7 @@ static NTSTATUS hybrid_object_migrate( struct hybrid_sync_object *ho, struct shm
     union shm_sync_value *to = info->ptr;
     NTSTATUS result;
 
-#ifdef DEBUG_OBJECTS
     memset( &post, 0x55, sizeof(post) );
-#endif
-//fprintf(stderr, "%s: %p --> %p\n", __func__, ho->value, info->ptr);
 
     /* initial volatile read */
     atomic_read( &pre, ho->value );

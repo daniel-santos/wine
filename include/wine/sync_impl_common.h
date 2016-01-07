@@ -209,7 +209,7 @@ static unsigned int hash28(unsigned int base, enum shm_sync_value_result flags, 
     /* flags should only contain flags */
     assert(!(flags & SHM_SYNC_VALUE_HASH_MASK));
 
-    /* slight modification of algo for speed (need to test uniqueness and random spread) */
+    /* slight modification of algo for speed */
     base ^= data;
     base *= FNV_32_PRIME;
     base ^= flags;
@@ -227,18 +227,6 @@ static unsigned int hash28(unsigned int base, enum shm_sync_value_result flags, 
 #endif
 }
 
-
-/* REMOVE: for debugging race conditions only! */
-#if WINE_SYNC_IS_SERVER
-static inline void assert_not_doing_move(struct hybrid_sync_object *ho){}
-#else
-static inline void assert_not_doing_move(struct hybrid_sync_object *ho)
-{
-    int curfr = interlocked_xchg_add((int*)&ho->flags_refcount, 0);
-    assert(!(curfr & HYBRID_SYNC_DBG_DOING_MOVE));
-}
-#endif
-
 /* atomically set the bit SHM_SYNC_VALUE_CORRUPTED_BIT and don't bother updating the
  * hash to match it */
 static __cold enum shm_sync_value_result sync_fail(struct hybrid_sync_object *ho, const char *fmt, ...)
@@ -251,7 +239,6 @@ static __cold enum shm_sync_value_result sync_fail(struct hybrid_sync_object *ho
         vfprintf(stderr, fmt, valist);
         va_end(valist);
     }
-assert_not_doing_move(ho);
     if (SYNC_DEBUG_ASSERTS)
         assert(0);
 
@@ -311,8 +298,6 @@ check_data(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr, int wai
     if (is_local_private(ho))
         return SHM_SYNC_VALUE_SUCCESS;
 
-assert_not_doing_move(ho);
-
     if (!WINE_SYNC_IS_SERVER)
         anomalous_flags_mask |= SHM_SYNC_VALUE_LOCKED;
 
@@ -324,9 +309,11 @@ assert_not_doing_move(ho);
     flags_hash = (int)hash28(hash_base, flags, pre_ptr->data);
     if (unlikely(pre_ptr->flags_hash != flags_hash))
     {
+#if 0
         barrier();
         if (ho->hash_base != hash_base)
             fprintf(stderr, "ho->hash_base != hash_base\n");
+#endif
         bad_hash(ho, pre_ptr, flags_hash);
         return SHM_SYNC_VALUE_CORRUPTED;
     }
@@ -502,23 +489,16 @@ static __noinline __cold NTSTATUS wine_sync_value_result_to_ntstatus(enum shm_sy
 {
     switch ((int)value)
     {
-    case SHM_SYNC_VALUE_SUCCESS:
-        return STATUS_SUCCESS;
-
-    case SHM_SYNC_VALUE_MOVED:
-#if !WINE_SYNC_IS_SERVER
-        return SHM_SYNC_VALUE_MOVED;
-#else
-        /* server should never get this flag, so fall-through to assert */
-#endif
-    case SHM_SYNC_VALUE_LOCKED:        /* check_data should intercept this on client, server shouldn't get it unexpectedly */
         /* intentional fall-through */
-    case SHM_SYNC_VALUE_CORRUPTED:     return STATUS_FILE_CORRUPT_ERROR;
+    case SHM_SYNC_VALUE_CORRUPTED:
+        return STATUS_FILE_CORRUPT_ERROR;
 
     /* a few NTSTATUS codes to pass on */
     case STATUS_TOO_MANY_THREADS:
     case STATUS_FILE_CORRUPT_ERROR:
         return (NTSTATUS)value;
+
+    /* all other values should be managed by check_data */
     default:
         assert(0);
         exit(1);
@@ -620,7 +600,8 @@ exit_error:
  * We may want to consider some mechanism of deciding rather we wake a local or server thread
  * (possibly some round-robin) when we know that a thread is waiting on the server as well.
  */
-NTSTATUS hybrid_semaphore_release(struct hybrid_semaphore *sem, unsigned int count, unsigned int *prev, int do_wake)
+NTSTATUS hybrid_semaphore_release(struct hybrid_semaphore *sem, unsigned int count,
+                                  unsigned int *prev, int do_wake)
 {
     NTSTATUS ret;
     union shm_sync_value pre;
@@ -724,8 +705,6 @@ NTSTATUS hybrid_semaphore_wait(struct hybrid_semaphore *sem, const struct timesp
         }
 
         result = futex_wait(&sem->ho.value->data, pre.data, timeout ? &t : NULL);
-//fprintf(stderr, "%s: futex_wait completed with %d, volatile read flags = %x\n", __func__, result,
-//    *((volatile int*)&sem->ho.value->flags_hash) & 0xf);
         if (!result)
             continue;
 

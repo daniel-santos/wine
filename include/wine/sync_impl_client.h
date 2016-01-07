@@ -155,8 +155,8 @@ static void __noinline hybrid_object_do_move_wait(struct hybrid_sync_object *ho)
     {
         int result;
 
-        curfr = interlocked_xchg_add((int*)&ho->flags_refcount, 0);
-        //atomic_read(&curfr, (int*)&ho->flags_refcount);
+        barrier();
+        atomic_read(&curfr, (int*)&ho->flags_refcount);
         if (!(curfr & HYBRID_SYNC_LOCKED_BIT))
             break;
 
@@ -201,9 +201,7 @@ static __must_check enum shm_sync_value_result hybrid_object_do_move( struct hyb
     if (locked)
     {
         NTSTATUS result;
-//fprintf(stderr, "%s: late bird\n", __func__);
 
-assert_not_doing_move(ho);
         if ((result = hybrid_object_release(ho)))
             return result;
 
@@ -212,10 +210,8 @@ assert_not_doing_move(ho);
         if ((result = hybrid_object_grab(ho)))
             return result;
 
-assert_not_doing_move(ho);
         return SHM_SYNC_VALUE_AGAIN;
     }
-//fprintf(stderr, "%s: early bird\n", __func__);
 
     /* else, we got the lock, so are responsible for the move */
 
@@ -237,10 +233,9 @@ assert_not_doing_move(ho);
     {
         int result;
 
-        curfr = interlocked_xchg_add((int*)&ho->flags_refcount, 0);
-//    fprintf(stderr, " %lx:%p:%08x ", syscall(SYS_gettid), ho, curfr);
+        barrier();
+        atomic_read( &curfr, &ho->flags_refcount );
 
-        //atomic_read( &curfr, &ho->flags_refcount );
         count = curfr >> HYBRID_SYNC_FLAGS_BITS;
         if (count == 1) /* one because we don't decrement for *this* thread */
             break;
@@ -269,9 +264,6 @@ assert_not_doing_move(ho);
             }
         }
     }
-    assert(!interlocked_test_and_set_bit((int *)&ho->flags_refcount, HYBRID_SYNC_DBG_DOING_MOVE_BIT));
-
-//    atomic_read( dest, &ho->value->int64 );
 
     /* in this state only the current thread has the right to change the
      * ho->value pointer. It is now the below callback function's responsibility
@@ -296,8 +288,6 @@ assert_not_doing_move(ho);
         interlocked_test_and_set_bit( (int *)&ho->flags_refcount, HYBRID_SYNC_BAD_BIT );
         ret = SHM_SYNC_VALUE_FAIL;
     }
-
-    assert(interlocked_test_and_reset_bit((int *)&ho->flags_refcount, HYBRID_SYNC_DBG_DOING_MOVE_BIT));
 
     /* This interlocked provides implicit barrier for changing the value pointer and hash_base
      * in do_move(). */
@@ -338,8 +328,8 @@ static __must_check NTSTATUS hybrid_object_grab(struct hybrid_sync_object *ho)
     unsigned int newfr;
 
 start_over:
-    curfr = interlocked_xchg_add((int *)&ho->flags_refcount, 0);
-    //atomic_read( &curfr, &ho->flags_refcount );
+    //curfr = interlocked_xchg_add((int *)&ho->flags_refcount, 0);
+    atomic_read( &curfr, &ho->flags_refcount );
 
     do {
         unsigned int refcount = curfr >> HYBRID_SYNC_FLAGS_BITS;
@@ -365,7 +355,6 @@ start_over:
 
         curfr = interlocked_cmpxchg((int *)&ho->flags_refcount, newfr, curfr);
     } while (unlikely( curfr != oldfr ));
-    //fprintf(stderr, " %lx:%p:begin ", syscall(SYS_gettid), ho);
 
     return STATUS_SUCCESS;
 }
@@ -386,8 +375,8 @@ static __must_check NTSTATUS hybrid_object_release(struct hybrid_sync_object *ho
     unsigned int oldfr;
     unsigned int newfr;
 
-    curfr = interlocked_xchg_add((int *)&ho->flags_refcount, 0);
-    //atomic_read( &curfr, &ho->flags_refcount );
+    //curfr = interlocked_xchg_add((int *)&ho->flags_refcount, 0);
+    atomic_read( &curfr, &ho->flags_refcount );
 
     do {
         unsigned int refcount = curfr >> HYBRID_SYNC_FLAGS_BITS;
