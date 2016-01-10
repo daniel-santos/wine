@@ -360,8 +360,8 @@ static void backtrace_tid(struct dbg_process* pcs, DWORD tid)
         {
             if (!GetThreadContext(dbg_curr_thread->handle, &context))
             {
-                dbg_printf("Can't get context for thread %04x in current process\n",
-                           tid);
+                dbg_printf("Can't get context for thread %04x in current process: %08x\n",
+                           tid, GetLastError());
             }
             else
             {
