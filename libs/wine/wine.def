@@ -92,3 +92,12 @@ EXPORTS
     wine_utf8_mbstowcs
     wine_utf8_wcstombs
     wine_wctype_table
+    tracer_alloc
+    tracer_do
+    tracer_dump
+    tracer_reset
+    dump_init
+    dump_printf
+    dump_indent_inc
+    dump_indent_dec
+    dump_obj
