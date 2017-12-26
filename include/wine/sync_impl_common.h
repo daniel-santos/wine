@@ -19,11 +19,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#ifndef WINE_SYNC_IS_SERVER
-# error "This is an unguarded header file that defines implementations"
-/* The following exists only to make my IDEs happy */
-# define WINE_SYNC_IS_SERVER 0
-//# include "wine/port.h"
+#ifdef IDE_PARSER
+/* Aids to KDevelop parsing.  */
 # include "ntstatus.h"
 #endif
 
@@ -53,24 +50,25 @@
 /* Set to 1 to fail an assertion on conditions caused by corrupted data in shared memory and zero
  * to respond with STATUS_FILE_CORRUPTED */
 #define SYNC_DEBUG_ASSERTS 1
-static enum shm_sync_value_result check_data_anomalous(struct hybrid_sync_object *ho,
-                                                       union shm_sync_value *pre_ptr,
-                                                       enum shm_sync_value_result flags, int wait_lock);
+static enum shm_sync_value_result
+check_data_anomalous(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr,
+		     enum shm_sync_value_result flags, int wait_lock);
 
-#if !WINE_SYNC_IS_SERVER /* client only */
+#if !WINESERVER /* client only */
 static struct
 {
     /* Function to get the new shared memory and change the value pointer. This
      * is callable by any function that attempts to dereference the value
      * pointer via the path check_data --> check_data_trans -->
      * check_data_anomalous --> hybrid_object_do_move */
-    NTSTATUS (*move)( struct hybrid_sync_object *ho );
+    NTSTATUS (*move)( struct hybrid_sync_object *ho, struct shm_object_info *info );
     NTSTATUS (*destroy)( struct hybrid_sync_object *ho );
+    void (*server_wake)( struct hybrid_sync_object *ho );
 } hybrid_object_client_fns = { NULL, NULL };
-#endif /* !WINE_SYNC_IS_SERVER (client only) */
+#endif /* !WINESERVER (client only) */
 
 /* where the server writes the last CPU number and the client reads it */
-static unsigned int *last_server_cpu_ptr = NULL;
+static volatile unsigned int *last_server_cpu_ptr = NULL;
 
 /******************************************************************
  *              sync_impl_init
@@ -78,13 +76,15 @@ static unsigned int *last_server_cpu_ptr = NULL;
  * Initialize static values in sync_impl.h translation unit. Call (at least) once from the .c file
  * you include this from.
  */
-static void sync_impl_init( NTSTATUS (*move)( struct hybrid_sync_object *ho ),
+static void sync_impl_init( NTSTATUS (*move)( struct hybrid_sync_object *ho, struct shm_object_info *info ),
                             NTSTATUS (*destroy)( struct hybrid_sync_object *ho ),
-                            unsigned int *_last_server_cpu_ptr )
+			    void (*server_wake)( struct hybrid_sync_object *ho ),
+                            volatile unsigned int *_last_server_cpu_ptr )
 {
-#if !WINE_SYNC_IS_SERVER
-    hybrid_object_client_fns.move    = move;
-    hybrid_object_client_fns.destroy = destroy;
+#if !WINESERVER
+    hybrid_object_client_fns.move    	   = move;
+    hybrid_object_client_fns.destroy	   = destroy;
+    hybrid_object_client_fns.server_wake = server_wake;
 #endif
     last_server_cpu_ptr              = _last_server_cpu_ptr;
 }
@@ -150,6 +150,7 @@ static FORCEINLINE int futex_wait(int *addr, int cur, struct timespec *timeout)
             fatal_futex_error("futex_wait", addr);
         }
     }
+    barrier();
 
     return 0;
 }
@@ -181,6 +182,19 @@ static FORCEINLINE int futex_wake(int *addr, int count)
     return ret;
 }
 
+static inline int hso_client_futex_wait( union hso_atomic *atomic, union hso_atomic *pre,
+                                         struct timespec *timeout )
+{
+    return futex_wait( hso_atomic_get_wait_addr( atomic ),
+                       *hso_atomic_get_wait_addr( pre ),
+                       timeout);
+}
+
+static inline int hso_client_futex_wake( union hso_atomic *atomic )
+{
+    return futex_wake( hso_atomic_get_wait_addr( atomic ), INT_MAX);
+}
+
 #define FNV_32_PRIME  (0x01000193)
 #define FNV1A_32_INIT (0x811c9dc5)
 
@@ -209,22 +223,25 @@ static unsigned int hash28(unsigned int base, enum shm_sync_value_result flags, 
     /* flags should only contain flags */
     assert(!(flags & SHM_SYNC_VALUE_HASH_MASK));
 
-    /* slight modification of algo for speed */
-    base ^= data;
-    base *= FNV_32_PRIME;
-    base ^= flags;
-    base *= FNV_32_PRIME;
+    if (0)
+    {
+	/* slight modification of algo for speed, but probably poor uniqueness */
+	base ^= data;
+	base *= FNV_32_PRIME;
+	base ^= flags;
+	base *= FNV_32_PRIME;
 
-    return (base << SHM_SYNC_VALUE_FLAGS_BITS) | flags;
+	return (base << SHM_SYNC_VALUE_FLAGS_BITS) | flags;
+    }
+    else
+    {
+	/* This implementation would be slower, but use the FVN-1a unmodified */
+	unsigned char in[5];
+	*((unsigned int*)in) = data;
+	in[4] = (unsigned char)flags;
 
-#if 0
-    /* This implementation would be slower, but use the FVN-1a unmodified */
-    unsigned char in[5];
-    *((unsigned int*)in) = data;
-    in[4] = (unsigned char)flags;
-
-    return (fnv1a_hash32(base, in, sizeof(in)) << SHM_SYNC_VALUE_FLAGS_BITS) | flags;
-#endif
+	return (fnv1a_hash32(base, in, sizeof(in)) << SHM_SYNC_VALUE_FLAGS_BITS) | flags;
+    }
 }
 
 /* atomically set the bit SHM_SYNC_VALUE_CORRUPTED_BIT and don't bother updating the
@@ -243,18 +260,13 @@ static __cold enum shm_sync_value_result sync_fail(struct hybrid_sync_object *ho
         assert(0);
 
     /* this bit lets all processes know that we're corrupted */
-    interlocked_test_and_set_bit(&ho->value->flags_hash, SHM_SYNC_VALUE_CORRUPTED_BIT);
+    interlocked_test_and_set_bit(&ho->atomic.value->flags_hash, SHM_SYNC_VALUE_CORRUPTED_BIT);
 
     /* this bit is for the local process, because now we don't trust that the
      * shared bit will not be overwritten */
-    interlocked_test_and_set_bit((int*)&ho->flags_refcount, HYBRID_SYNC_BAD);
+    interlocked_test_and_set_bit((int*)&ho->atomic.flags_refcounts, HYBRID_SYNC_BAD);
 
     return SHM_SYNC_VALUE_CORRUPTED;
-}
-
-static inline int is_local_private(struct hybrid_sync_object *ho)
-{
-    return WINE_SYNC_IS_SERVER && hybrid_object_is_server_private(ho);
 }
 
 static __cold void bad_hash(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr, int hash)
@@ -268,6 +280,23 @@ static __cold void bad_hash(struct hybrid_sync_object *ho, union shm_sync_value 
               b >> SHM_SYNC_VALUE_FLAGS_BITS, b & SHM_SYNC_VALUE_FLAGS_MASK);
 }
 
+
+
+
+
+/* TODO: Move to port.h.  */
+static inline __int64 locked_read64( __int64 *addr )
+{
+#if 0 && (defined(__x86_64__) || defined(__aarch64__) || defined(_WIN64))
+    __int64 ret;
+    __asm__ __volatile__( "lock; movq (%1),%0": "=r" (ret) : "r"(addr) : );
+    return ret;
+#else
+    return interlocked_cmpxchg64( addr, *addr, *addr );
+#endif
+}
+
+
 /******************************************************************************
  *              check_data
  *
@@ -280,6 +309,10 @@ static __cold void bad_hash(struct hybrid_sync_object *ho, union shm_sync_value 
  *                  SHM_SYNC_VALUE_LOCKED bit is set, automatically call
  *                  hybrid_object_wait_global_lock(), otherwise return the bit
  *                  value.
+ * maybe_stale  [I] Set to true if the pre value was obtained by a normal
+ *                  read, false if it was obtained by an atomic instruction.
+ *                  When true, anomalous conditions result in
+ *                  SHM_SYNC_VALUE_AGAIN.
  *
  * Returns
  *      SHM_SYNC_VALUE_SUCCESS          if the caller should proceed as normal
@@ -288,34 +321,41 @@ static __cold void bad_hash(struct hybrid_sync_object *ho, union shm_sync_value 
  *      SHM_SYNC_VALUE_FAIL             client: object is unusable due to error in migration
  */
 static FORCEINLINE enum shm_sync_value_result
-check_data(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr, int wait_lock)
+check_data(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr, int maybe_stale, int wait_lock)
 {
     int flags;
     int flags_hash;
     int hash_base            = ho->hash_base;
-    int anomalous_flags_mask = (SHM_SYNC_VALUE_MOVED | SHM_SYNC_VALUE_CORRUPTED);
+    int anomalous_flags_mask = SHM_SYNC_VALUE_MOVED | SHM_SYNC_VALUE_CORRUPTED;
 
-    if (is_local_private(ho))
-        return SHM_SYNC_VALUE_SUCCESS;
-
-    if (!WINE_SYNC_IS_SERVER)
-        anomalous_flags_mask |= SHM_SYNC_VALUE_LOCKED;
-
-    if (pre_ptr->flags_hash & anomalous_flags_mask)
-        return check_data_anomalous(ho, pre_ptr, pre_ptr->flags_hash, wait_lock);
+    if (0)
+    {
+again:
+        pre_ptr->int64 = locked_read64( &ho->atomic.value->int64 );
+        maybe_stale = FALSE;
+    }
 
     /* verify no corruption */
     flags      = pre_ptr->flags_hash & SHM_SYNC_VALUE_FLAGS_MASK;
     flags_hash = (int)hash28(hash_base, flags, pre_ptr->data);
     if (unlikely(pre_ptr->flags_hash != flags_hash))
     {
-#if 0
-        barrier();
-        if (ho->hash_base != hash_base)
-            fprintf(stderr, "ho->hash_base != hash_base\n");
-#endif
+        if (maybe_stale)
+            goto again;
+
         bad_hash(ho, pre_ptr, flags_hash);
         return SHM_SYNC_VALUE_CORRUPTED;
+    }
+
+    if (!WINESERVER)
+        anomalous_flags_mask |= SHM_SYNC_VALUE_LOCKED;
+
+    if (pre_ptr->flags_hash & anomalous_flags_mask)
+    {
+        if (maybe_stale)
+            goto again;
+
+        return check_data_anomalous(ho, pre_ptr, pre_ptr->flags_hash, wait_lock);
     }
 
     return SHM_SYNC_VALUE_SUCCESS;
@@ -348,30 +388,25 @@ check_data(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr, int wai
  *  SHM_SYNC_VALUE_AGAIN -- the value changed and the operation should be attempted again (EAGAIN would be a better value)
  */
 static FORCEINLINE enum shm_sync_value_result
-sync_try_op(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr,
+sync_try_op(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr, int maybe_stale,
             union shm_sync_value *post_ptr, int data, int flags)
 {
     union shm_sync_value new_value;
     union shm_sync_value updated_value;
-    NTSTATUS ret = SHM_SYNC_VALUE_SUCCESS;
+    enum shm_sync_value_result ret = SHM_SYNC_VALUE_SUCCESS;
 
-    if (!is_local_private( ho ))
-    {
-        ret = check_data( ho, pre_ptr, TRUE );
-        if ( ret )
-            return ret;
+    ret = check_data( ho, pre_ptr, maybe_stale, TRUE );
+    if (ret)
+        return ret;
 
-        if (!WINE_SYNC_IS_SERVER)
-            /* if any of these flags are set, client should not be attempting any operation */
-            assert(!(flags & (SHM_SYNC_VALUE_LOCKED | SHM_SYNC_VALUE_MOVED | SHM_SYNC_VALUE_CORRUPTED)));
+    if (!WINESERVER)
+        /* if any of these flags are set, client should not be attempting any operation */
+        assert(!(flags & (SHM_SYNC_VALUE_LOCKED | SHM_SYNC_VALUE_MOVED | SHM_SYNC_VALUE_CORRUPTED)));
 
-        new_value.flags_hash = hash28(ho->hash_base, flags, data);
-    }
-    else
-        new_value.flags_hash = 0;
+    new_value.flags_hash = hash28(ho->hash_base, flags, data);
     new_value.data = data;
 
-    updated_value.int64 = interlocked_cmpxchg64(&ho->value->int64,
+    updated_value.int64 = interlocked_cmpxchg64(&ho->atomic.value->int64,
                                                 new_value.int64, pre_ptr->int64);
 
     if (updated_value.int64 != pre_ptr->int64)
@@ -389,58 +424,28 @@ sync_try_op(struct hybrid_sync_object *ho, union shm_sync_value *pre_ptr,
  *
  * PARAMS
  *  ho          [IO]    The object to initialize
- *  value       [I]     A pointer to a union shm_sync_value object in shared memory
- *                      or NULL in any other case (see truth table below)
- *  local_flags [I]     Flags possibly containing only HYBRID_SYNC_SERVER_PRIVATE
- *  hash_base   [I]     the base value used to create hash for the object (or zero)
- *
- * Truth table of acceptable parameter values
- *  _____  ________  _____________________  ___________
- * |     || flags  ||       value         ||           |
- *  From   svr_prvt  input   result         Description
- * ----------------------------------------------------
- * server  0         -> shm  -> shm         server-side of shared memory object
- * client  0         -> shm  -> shm         client-side of shared memory object
- * server  1         NULL    &private_value server-side private object
- * client  1         NULL    NULL           client-side stub for interacting with server-private
- *                                          object (all actions routed through server calls).
- *
- * Legend of columns:
- * From          - whether the call to hybrid_object_init() is made via the client or server
- * svr_prvt      - value of HYBRID_SYNC_SERVER_PRIVATE bit is set in local_flags
- * value, input  - the value passed as the 'value' parameter
- * value, result - the the resultant value of ho->value
+ *  info        [I]     If private is set, ptr should be NULL and the object will be initialized
+ *                      as a stub that simply indicates server calls should be used.  Otherwise,
+ *                      ptr, should point to the shared memory object, and shm_id and offset
+ *                      should be set.
  */
-static void hybrid_object_init(struct hybrid_sync_object *ho, union shm_sync_value *value,
-                               int local_flags, unsigned int hash_base)
+static void hybrid_object_init(struct hybrid_sync_object *ho, struct shm_object_info *info)
+
 {
-    assert(!(local_flags & ~HYBRID_SYNC_INIT_MASK));
+    /* Must either be private or have a pointer to shared memory. */
+    assert( !!info->private ^ !!info->ptr );
 
-    /* If private, then you do not pass a value -- it will either be NULL if the
-     * storage is foreign or set to &private_value if local. If not private then
-     * a value pointer is required. */
-    assert((local_flags & HYBRID_SYNC_SERVER_PRIVATE) ? !value : !!value);
-
-    if (value) {
-        ho->value          = value;
-        ho->hash_base      = hash_base;
+    if (info->private) {
+        ho->atomic.value = NULL;
+        ho->hash_base = 0;
     } else {
-        if (WINE_SYNC_IS_SERVER)
-            ho->value      = &ho->private_value;
-        else
-            ho->value      = NULL;
-
-        /* ho->private_value intentionally left uninitialized since it should be
-         * inited by derived class via ho->value if the object is local to the
-         * process -- never inited otherwise */
+        ho->atomic.value = info->ptr;
+        ho->hash_base = fnv1a_hash32( FNV1A_32_INIT, info->hash_base_in,
+                                      sizeof(info->hash_base_in) );
     }
-
-    /* server does not use ho->flags_refcount for reference counting, but client
-     * does, so increment it only for client */
-    if (!WINE_SYNC_IS_SERVER)
-        local_flags |= (1u << HYBRID_SYNC_FLAGS_BITS);
-
-    ho->flags_refcount = local_flags;
+    /* Server does not use ho->atomic.flags_refcount for reference counting, but client
+     * does, so increment it only for client. */
+    ho->atomic.flags_refcounts = hso_atomic_make_flags_refcounts(0, !WINESERVER, 0);
 }
 
 /******************************************************************
@@ -460,19 +465,15 @@ static void hybrid_object_init(struct hybrid_sync_object *ho, union shm_sync_val
  */
 NTSTATUS hybrid_semaphore_init(struct hybrid_semaphore *sem, unsigned int initial, unsigned int max)
 {
-    union shm_sync_value *value = sem->ho.value;
+    union shm_sync_value *value = sem->ho.atomic.value;
 
+    assert( value );
     if (max > (unsigned int)INT_MAX || initial > max)
         return STATUS_INVALID_PARAMETER;
 
-    if (value)
-    {
-        value->data       = initial;
-        value->flags_hash = hybrid_object_is_server_private(&sem->ho)
-                          ? 0
-                          : hash28(sem->ho.hash_base, 0, initial);
-    }
-    sem->max              = max;
+    value->data       = initial;
+    value->flags_hash = hash28(sem->ho.hash_base, 0, initial);
+    sem->max          = max;
 
     return STATUS_SUCCESS;
 }
@@ -489,7 +490,8 @@ static __noinline __cold NTSTATUS wine_sync_value_result_to_ntstatus(enum shm_sy
 {
     switch ((int)value)
     {
-        /* intentional fall-through */
+    case SHM_SYNC_VALUE_FAIL:
+	/* TODO: handle failure with retry?  */
     case SHM_SYNC_VALUE_CORRUPTED:
         return STATUS_FILE_CORRUPT_ERROR;
 
@@ -528,57 +530,58 @@ static __noinline __cold NTSTATUS wine_sync_value_result_to_ntstatus(enum shm_sy
  *
  * NOTE: fast path roughly 336 bytes on 64-bit with two function calls to hash28()
  */
-NTSTATUS __hybrid_semaphore_op(struct hybrid_semaphore *sem, union shm_sync_value *pre_ptr, int change)
+NTSTATUS __hybrid_semaphore_op(struct hybrid_semaphore *sem, union shm_sync_value *pre_ptr, int maybe_stale, int change)
 {
     struct hybrid_sync_object *ho = &sem->ho;
     enum shm_sync_value_result result;
     union shm_sync_value post;
+    NTSTATUS ret;
 
     /* get can only decrement by one */
     assert( change >= 0 || change == -1 );
 
     do {
-        /* initial volatile read */
-        atomic_read( pre_ptr, ho->value );
-        result = check_data( ho, pre_ptr, TRUE );
-    } while (result == SHM_SYNC_VALUE_AGAIN);
+        int cur_value  = pre_ptr->data;         /* Current (known) value.  */
+        int new_value  = cur_value + change;    /* Proposed new value.  */
+        int swap_value = cur_value;             /* Value to be used in swap.  */
+        int flags      = 0;
 
-    if (result)
-        goto exit_error;
-
-    do {
-        int cur_value = pre_ptr->data;
-        int new_value = cur_value + change;
-        int flags     = 0;
+        ret = STATUS_SUCCESS;
 
         if (cur_value > (int)sem->max)
-        {
-            sync_fail(ho, "ERROR %s: data exceeds maximum value, (bug or corruption)\n", __func__);
-            return STATUS_FILE_CORRUPT_ERROR;
-        }
+            ret = STATUS_FILE_CORRUPT_ERROR;
 
-        /* check for overflow */
-        if (new_value > (int)sem->max || (change > 0 ? new_value < cur_value : new_value > cur_value ))
-            return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+        /* Check for overflow.  */
+        else if (new_value > (int)sem->max || (change > 0 ? new_value < cur_value
+                                                          : new_value > cur_value ))
+            ret = STATUS_SEMAPHORE_LIMIT_EXCEEDED;
 
-        /* trying to acquire signal, but not signaled */
-        if (change < 0 && cur_value == 0)
+        /* Trying to acquire signal, but not signaled.  */
+        else if (change == -1 && cur_value == 0)
         {
             /* server always uses transaction for (try)wait */
-            assert(!WINE_SYNC_IS_SERVER);
+            assert(!WINESERVER);
 
             /* client will fail the operation */
-            return STATUS_WAS_LOCKED;
+            ret = STATUS_WAS_LOCKED;
         }
+        else
+            swap_value = new_value;
 
-        result = sync_try_op(ho, pre_ptr, &post, new_value, flags);
+        result = sync_try_op(ho, pre_ptr, maybe_stale, &post, swap_value, flags);
+        maybe_stale = FALSE;
     } while (result == SHM_SYNC_VALUE_AGAIN);
 
     if (result)
-exit_error:
         return wine_sync_value_result_to_ntstatus(result);
-
-    return STATUS_SUCCESS;
+    else if (ret)
+    {
+        if (ret == STATUS_FILE_CORRUPT_ERROR)
+            sync_fail(ho, "ERROR %s: data exceeds maximum value, (bug or corruption)\n", __func__);
+        return ret;
+    }
+    else
+        return STATUS_SUCCESS;
 }
 
 /******************************************************************
@@ -600,29 +603,30 @@ exit_error:
  * We may want to consider some mechanism of deciding rather we wake a local or server thread
  * (possibly some round-robin) when we know that a thread is waiting on the server as well.
  */
-NTSTATUS hybrid_semaphore_release(struct hybrid_semaphore *sem, unsigned int count,
-                                  unsigned int *prev, int do_wake)
+NTSTATUS hybrid_semaphore_release( struct hybrid_semaphore *sem, unsigned int count,
+                                   unsigned int *prev )
 {
     NTSTATUS ret;
-    union shm_sync_value pre;
+    union shm_sync_value pre = *sem->ho.atomic.value;
 
     if (count > INT_MAX)
         return STATUS_INVALID_PARAMETER;
 
-    ret = __hybrid_semaphore_op(sem, &pre, count);
+
+    ret = __hybrid_semaphore_op(sem, &pre, TRUE, count);
     if (ret)
         return ret;
 
     if (prev)
         *prev = pre.data;
 
-    if (do_wake)
-        futex_wake(&sem->ho.value->data, count);
+#if !WINESERVER
+    if (pre.flags_hash & SHM_SYNC_VALUE_WAKE_SERVER)
+        hybrid_object_client_fns.server_wake( &sem->ho );
+#endif
 
-    if (pre.flags_hash & SHM_SYNC_VALUE_NOTIFY_SVR)
-        return SHM_SYNC_VALUE_NOTIFY_SVR;
-    else
-        return STATUS_SUCCESS;
+    futex_wake(&sem->ho.atomic.value->data, count);
+    return STATUS_SUCCESS;
 }
 
 #define ONE_BILLION 1000000000ll
@@ -673,14 +677,9 @@ static inline void timespec_remain(struct timespec *dest, const struct timespec 
     timespec_sub(dest, duration, dest);
 }
 
-/*
- * NOTE: fast path is 108 bytes with calls to get_time() and __hybrid_semaphore_op()
- *       contended path is 354 bytes
- *       eats 64 bytes of stack because struct timespec is huge
- */
 NTSTATUS hybrid_semaphore_wait(struct hybrid_semaphore *sem, const struct timespec *timeout)
 {
-    union shm_sync_value pre;
+    union shm_sync_value pre = *sem->ho.atomic.value;
     struct timespec start;
     struct timespec t;
     NTSTATUS ret;
@@ -690,7 +689,7 @@ NTSTATUS hybrid_semaphore_wait(struct hybrid_semaphore *sem, const struct timesp
     for (;;) {
         int result;
 
-        ret = __hybrid_semaphore_op(sem, &pre, -1);
+        ret = __hybrid_semaphore_op(sem, &pre, TRUE, -1);
 
         if (ret != STATUS_WAS_LOCKED)
             return ret;
@@ -704,14 +703,15 @@ NTSTATUS hybrid_semaphore_wait(struct hybrid_semaphore *sem, const struct timesp
                 return STATUS_TIMEOUT;
         }
 
-        result = futex_wait(&sem->ho.value->data, pre.data, timeout ? &t : NULL);
-        if (!result)
-            continue;
-
+        result = futex_wait(&sem->ho.atomic.value->data, pre.data, timeout ? &t : NULL);
+	pre = *(volatile union shm_sync_value*)sem->ho.atomic.value;
         switch (-result) {
+	    case 0:
+		continue;
+
             /* repeat if value changes or we are interrupted by a signal */
-            case EINTR:
             case EWOULDBLOCK:
+            case EINTR:
                 continue;
 
             case ETIMEDOUT:
@@ -720,6 +720,72 @@ NTSTATUS hybrid_semaphore_wait(struct hybrid_semaphore *sem, const struct timesp
     }
     return ret;
 }
+
+
+
+
+#if 0
+
+/******************************************************************************
+ *              __hybrid_mutex_op
+ *
+ * Perform any operation on a mutex object.
+ */
+NTSTATUS __hybrid_mutex_op(struct hybrid_mutex *mutex, union shm_sync_value *pre_ptr, int maybe_stale, int change)
+{
+    struct hybrid_sync_object *ho = &mutex->ho;
+    enum shm_sync_value_result result;
+    union shm_sync_value post;
+    NTSTATUS ret;
+
+    assert( change == 1 || change == -1 );
+
+    do {
+        int cur_owner  = pre_ptr->data;         /* Current (known) value.  */
+        int new_value  = cur_value + change;    /* Proposed new value.  */
+        int swap_value = cur_value;             /* Value to be used in swap.  */
+        int flags      = 0;
+#if 0
+#endif
+        ret = STATUS_SUCCESS;
+
+        if (cur_value > (int)sem->max)
+            ret = STATUS_FILE_CORRUPT_ERROR;
+
+        /* Check for overflow.  */
+        else if (new_value > (int)sem->max || (change > 0 ? new_value < cur_value
+                                                          : new_value > cur_value ))
+            ret = STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+
+        /* Trying to acquire signal, but not signaled.  */
+        else if (change < 0 && cur_value == 0)
+        {
+            /* server always uses transaction for (try)wait */
+            assert(!WINESERVER);
+
+            /* client will fail the operation */
+            ret = STATUS_WAS_LOCKED;
+        }
+        else
+            swap_value = new_value;
+
+        result = sync_try_op(ho, pre_ptr, maybe_stale, &post, swap_value, flags);
+        maybe_stale = FALSE;
+    } while (result == SHM_SYNC_VALUE_AGAIN);
+
+    if (result)
+        return wine_sync_value_result_to_ntstatus(result);
+    else if (ret)
+    {
+        if (ret == STATUS_FILE_CORRUPT_ERROR)
+            sync_fail(ho, "ERROR %s: data exceeds maximum value, (bug or corruption)\n", __func__);
+        return ret;
+    }
+    else
+        return STATUS_SUCCESS;
+}
+
+#endif
 
 /* dump functions */
 static void wine_sync_value_dump(const union shm_sync_value *value, char **start, const char *const end)
@@ -753,31 +819,24 @@ void hybrid_object_dump(const struct hybrid_sync_object *ho, char **start, const
         count = snprintf(*start, end - *start, "(NULL)");
     else
     {
-        count = snprintf(*start, end - *start, "%p {value = %s", ho, ho->value ? "" : "(NULL)");
+        count = snprintf(*start, end - *start, "%p {value = %s", ho, ho->atomic.value ? "" : "(NULL)");
         if (count < 0)
             goto error;
 
         *start += count;
 
-        if (ho->value)
-            wine_sync_value_dump(ho->value, start, end);
+        if (ho->atomic.value)
+            wine_sync_value_dump(ho->atomic.value, start, end);
 
-        if (ho->value == &ho->private_value)
-            count = snprintf(*start, end - *start,
-                             " (--> &private_value), "
-                             "flags_refcount = 0x%08x (.flags = 0x%02x, .refcount = %d)}",
-                             ho->flags_refcount,
-                             ho->flags_refcount & HYBRID_SYNC_FLAGS_MASK,
-                             (int)(ho->flags_refcount) >> HYBRID_SYNC_FLAGS_BITS);
-        else
-            count = snprintf(*start, end - *start,
-                             ", "
-                             "flags_refcount = 0x%08x (.flags = 0x%02x, .refcount = %d), "
-                             "hash_base = 0x%08x}",
-                             ho->flags_refcount,
-                             ho->flags_refcount & HYBRID_SYNC_FLAGS_MASK,
-                             (int)(ho->flags_refcount) >> HYBRID_SYNC_FLAGS_BITS,
-                             ho->hash_base);
+        count = snprintf(*start, end - *start,
+                         ", "
+                         "flags_refcounts = 0x%08lx (.flags = 0x%02lx, .refcount = %lu, .waiters = %lu), "
+                         "hash_base = 0x%08x}",
+                         ho->atomic.flags_refcounts,
+                         hso_atomic_get_flags( &ho->atomic ),
+                         hso_atomic_get_refcount( &ho->atomic ),
+                         hso_atomic_get_waitcount( &ho->atomic ),
+                         ho->hash_base);
     }
 
     if (count < 0)

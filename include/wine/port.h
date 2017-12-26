@@ -262,17 +262,16 @@ extern int ffs( int x );
 #endif
 
 #ifndef HAVE_FFSL
-extern int ffsl(long int x);
+extern int ffsl( long int x );
 #endif
 
-/* FIXME: make this clean & portable */
 /* count trailing ones */
-static inline int ctol(long val)
+static inline int ctol( long val )
 {
 #if defined(__GNUC__) && __GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4)
-    return __builtin_ctzl(~val);
+    return __builtin_ctzl( ~val );
 #else
-    return ffsl(~val) - 1;
+    return ffsl( ~val ) - 1;
 #endif
 }
 
@@ -496,6 +495,20 @@ static inline unsigned char interlocked_cmpxchg128( __int64 *dest, __int64 xchg_
 }
 #endif
 
+static inline void cpu_relax(void)
+{
+#ifdef __i386__
+    __asm__ __volatile__( "rep;nop" : : : "memory" );
+#else
+    __asm__ __volatile__( "" : : : "memory" );
+#endif
+}
+
+static inline void barrier(void)
+{
+    asm volatile ("" : : : "memory");
+}
+
 #else  /* __GNUC__ */
 
 #ifdef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4
@@ -521,6 +534,16 @@ extern int interlocked_xchg_add( int *dest, int incr );
 extern int interlocked_test_and_set_bit( int *dest, int bit );
 extern int interlocked_test_and_reset_bit( int *dest, int bit );
 extern int interlocked_xchg( int *dest, int val );
+static inline void cpu_relax(void)
+{
+    /* TODO: won't work on older versions of msvc */
+    __mm_pause();
+}
+
+static inline void barrier(void)
+{
+    _ReadWriteBarrier();
+}
 #endif
 
 #if (defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) && __SIZEOF_POINTER__ == 4) \
@@ -587,104 +610,5 @@ extern __int64 interlocked_cmpxchg64( __int64 *dest, __int64 xchg, __int64 compa
 #define usleep                  __WINE_NOT_PORTABLE(usleep)
 
 #endif /* NO_LIBWINE_PORT */
-
-static inline void cpu_relax(void)
-{
-#ifdef __i386__
-    __asm__ __volatile__( "rep;nop" : : : "memory" );
-#else
-    __asm__ __volatile__( "" : : : "memory" );
-#endif
-}
-
-static inline void barrier(void)
-{
-    asm volatile ("" : : : "memory");
-}
-
-/* FIXME: clean up this crappiness */
-#define __int8 char
-#define __int16 short
-#define __int32 int
-
-/* read a volatile value atomically (even for 64 bits on a machine with a 32 bit word) */
-static inline void __atomic_read( void *dest, const volatile void *src, size_t size )
-{
-    switch (size)
-    {
-        case 1: *(__int8 *)dest = *(const volatile __int8 *)src; break;
-        case 2: *(__int16*)dest = *(const volatile __int16*)src; break;
-        /* TODO: Does ARM do atomic read/writes to 32 bit values in all cases? thumb mode? */
-        case 4: *(__int32*)dest = *(const volatile __int32*)src; break;
-        case 8:
-#ifdef __x86_64__
-        /* TODO: any other archs that can do an atomic read of 64 bits? */
-                *(__int64*)dest = *(const volatile __int64*)src; break;
-#else
-        {
-            __int64 old_value;
-            __int64 new_value;
-
-            /* possible "read w/o init' warning here */
-            new_value = *(volatile __int64*)dest;
-            do
-            {
-                old_value = new_value;
-                /* stupid trick for atomic read */
-                new_value = interlocked_cmpxchg64( (__int64 *)src, old_value, old_value );
-
-            } while (new_value != old_value);
-            *(__int64*)dest = new_value;
-        }
-        break;
-#endif
-        default:
-            assert(0);
-    }
-}
-
-/* write a volatile value atomically (even for 64 bits on a machine with a 32 bit word) */
-static inline void __atomic_write( volatile void *dest, const void *src, size_t size )
-{
-    switch (size)
-    {
-        case 1: *(volatile __int8 *)dest = *(const __int8 *)src; break;
-        case 2: *(volatile __int16*)dest = *(const __int16*)src; break;
-        case 4: *(volatile __int32*)dest = *(const __int32*)src; break;
-        case 8:
-#ifdef __x86_64__
-                *(volatile __int64*)dest = *(const __int64*)src; break;
-#else
-        {
-            __int64 old_value;
-            __int64 new_value;
-
-            new_value = *(const volatile __int64*)src;
-            do
-            {
-                old_value = new_value;
-                new_value = interlocked_cmpxchg64( (__int64 *)dest, *(const __int64*)src, old_value );
-
-            } while (new_value != old_value);
-        }
-        break;
-#endif
-        default:
-            assert(0);
-    }
-}
-
-#define atomic_read( dest, src ) \
-    do { \
-        assert( sizeof(*(dest)) == sizeof(*(src)) ); \
-        __atomic_read( dest, src, sizeof(*(dest)) ); \
-    } while(0)
-
-#define atomic_write( dest, src ) \
-    do { \
-        assert( sizeof(*(dest)) == sizeof(*(src)) ); \
-        __atomic_write( dest, src, sizeof(*(dest)) ); \
-    } while(0)
-
 
 #endif /* !defined(__WINE_WINE_PORT_H) */

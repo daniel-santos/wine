@@ -37,6 +37,8 @@ struct request_header
     data_size_t  reply_size;
 };
 
+#define SERVER_REQUEST_REPLY_SIZE_POST  ((data_size_t)0x80000000)
+
 struct reply_header
 {
     unsigned int error;
@@ -53,6 +55,22 @@ struct request_max_size
 #define FIRST_USER_HANDLE 0x0020
 #define LAST_USER_HANDLE  0xffef
 
+
+typedef struct
+{
+    unsigned int last_input_time;
+    unsigned int foreground_wnd_epoch;
+    unsigned int last_server_cpu;
+} shmglobal_t;
+
+
+typedef struct
+{
+    int             queue_bits;
+    user_handle_t   input_focus;
+    user_handle_t   input_capture;
+    user_handle_t   input_active;
+} shmlocal_t;
 
 
 typedef union
@@ -1359,9 +1377,15 @@ struct create_semaphore_reply
 {
     struct reply_header __header;
     obj_handle_t handle;
-    char __pad_12[4];
+    unsigned int private;
+    client_ptr_t shm_id;
+    unsigned int offset;
+    char __pad_28[4];
 };
 
+
+#define SYNC_OBJECT_ACCESS_SERVER_ONLY    0x8000
+#define SYNC_OBJECT_ACCESS_MASK           (~SYNC_OBJECT_ACCESS_SERVER_ONLY)
 
 
 struct release_semaphore_request
@@ -1403,7 +1427,10 @@ struct open_semaphore_reply
 {
     struct reply_header __header;
     obj_handle_t handle;
-    char __pad_12[4];
+    unsigned int private;
+    client_ptr_t shm_id;
+    unsigned int offset;
+    unsigned int max;
 };
 
 
@@ -1518,6 +1545,23 @@ struct get_directory_cache_entry_reply
     int          entry;
     /* VARARG(free,ints); */
     char __pad_12[4];
+};
+
+
+
+struct get_shared_memory_request
+{
+    struct request_header __header;
+    thread_id_t  tid;
+    obj_handle_t handle;
+    int          release_old;
+};
+struct get_shared_memory_reply
+{
+    struct reply_header __header;
+    client_ptr_t shm_id;
+    unsigned int offset;
+    unsigned int size;
 };
 
 
@@ -5595,6 +5639,18 @@ struct terminate_job_reply
 };
 
 
+
+struct notify_signaled_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct notify_signaled_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -5644,6 +5700,7 @@ enum request
     REQ_get_handle_unix_name,
     REQ_get_handle_fd,
     REQ_get_directory_cache_entry,
+    REQ_get_shared_memory,
     REQ_flush,
     REQ_get_volume_info,
     REQ_lock_file,
@@ -5885,6 +5942,7 @@ enum request
     REQ_set_job_limits,
     REQ_set_job_completion_port,
     REQ_terminate_job,
+    REQ_notify_signaled,
     REQ_NB_REQUESTS
 };
 
@@ -5939,6 +5997,7 @@ union generic_request
     struct get_handle_unix_name_request get_handle_unix_name_request;
     struct get_handle_fd_request get_handle_fd_request;
     struct get_directory_cache_entry_request get_directory_cache_entry_request;
+    struct get_shared_memory_request get_shared_memory_request;
     struct flush_request flush_request;
     struct get_volume_info_request get_volume_info_request;
     struct lock_file_request lock_file_request;
@@ -6180,6 +6239,7 @@ union generic_request
     struct set_job_limits_request set_job_limits_request;
     struct set_job_completion_port_request set_job_completion_port_request;
     struct terminate_job_request terminate_job_request;
+    struct notify_signaled_request notify_signaled_request;
 };
 union generic_reply
 {
@@ -6232,6 +6292,7 @@ union generic_reply
     struct get_handle_unix_name_reply get_handle_unix_name_reply;
     struct get_handle_fd_reply get_handle_fd_reply;
     struct get_directory_cache_entry_reply get_directory_cache_entry_reply;
+    struct get_shared_memory_reply get_shared_memory_reply;
     struct flush_reply flush_reply;
     struct get_volume_info_reply get_volume_info_reply;
     struct lock_file_reply lock_file_reply;
@@ -6473,8 +6534,9 @@ union generic_reply
     struct set_job_limits_reply set_job_limits_reply;
     struct set_job_completion_port_reply set_job_completion_port_reply;
     struct terminate_job_reply terminate_job_reply;
+    struct notify_signaled_reply notify_signaled_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 543
+#define SERVER_PROTOCOL_VERSION 544
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -35,7 +35,9 @@ struct process_group
     struct list          entry;         /* entry in list of all process_groups */
     struct list          objects;       /* list of all objects in group */
     unsigned             global:1;      /* process group for global handles? */
-    unsigned             size:31;       /* size of processes array */
+    unsigned             alive:1;
+    unsigned             size:30;       /* size of processes array */
+    unsigned             refcount;
     struct process      *processes[1];  /* pointer to processes */
 };
 
@@ -65,14 +67,14 @@ extern int process_group_manage_object( struct hybrid_server_object *hso, struct
                                         obj_handle_t handle, int remove, enum pg_event event );
 extern int process_group_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
 extern int process_group_obj_remove( struct hybrid_server_object *hso, struct process *process,
-                                     obj_handle_t handle, enum pg_event event );
+                                     obj_handle_t handle, enum pg_event event, void *old_shm );
 extern int process_group_obj_add( struct process_group *pg, struct hybrid_server_object *hso,
-                                  obj_handle_t handle, struct shm_object_info *info );
+                                  obj_handle_t handle, struct shm_object_info *info, int allocate_shm );
 extern void process_group_get_info( struct hybrid_server_object *hso, struct shm_object_info *info );
-//extern int process_group_close( struct hybrid_server_object *hso, struct process *process );
 extern void process_group_term( struct process *process );
 extern int process_group_get_new_release_old( struct hybrid_server_object *hso, struct process *process,
-                                              obj_handle_t handle, struct shm_object_info *info );
+                                              obj_handle_t handle, struct shm_object_info *info, int release_old );
+extern void process_group_check_sanity( struct hybrid_server_object *hso );
 
 #ifdef DEBUG_OBJECTS
 enum process_group_dump_flags {

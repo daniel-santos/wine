@@ -265,7 +265,7 @@ static obj_handle_t alloc_handle_entry( struct process *process, void *ptr,
         set_error( STATUS_PROCESS_IS_TERMINATING );
         return 0;
     }
-    if (object_is_shared( obj ) && process_group_manage_object( ptr, process, 0, FALSE, PG_EVENT_ACCESS ))
+    if (type_is_shared_object( obj ) && process_group_manage_object( ptr, process, 0, FALSE, PG_EVENT_ACCESS ))
     {
         assert( get_error() );
         return 0;
@@ -429,8 +429,9 @@ static inline struct object *get_magic_handle( obj_handle_t handle )
 }
 
 /* retrieve the object corresponding to a handle, incrementing its refcount */
-struct object *get_handle_obj( struct process *process, obj_handle_t handle,
-                               unsigned int access, const struct object_ops *ops )
+struct object *get_handle_polytype_obj( struct process *process, obj_handle_t handle,
+                                        unsigned int access, const struct object_ops *const ops[],
+                                        size_t ops_size )
 {
     struct handle_entry *entry;
     struct object *obj;
@@ -446,10 +447,18 @@ struct object *get_handle_obj( struct process *process, obj_handle_t handle,
         obj          = entry->ptr;
         check_access = 1;
     }
-    if (ops && (obj->ops != ops))
+    if (ops && ops[0])
     {
-        set_error( STATUS_OBJECT_TYPE_MISMATCH );  /* not the right type */
-        return NULL;
+        int i;
+        for (i = 0; i < ops_size; ++i)
+            if (ops[i] == obj->ops)
+                break;
+
+        if (i == ops_size)
+        {
+            set_error( STATUS_OBJECT_TYPE_MISMATCH );  /* not the right type */
+            return NULL;
+        }
     }
     if (check_access && (entry->access & access) != access)
     {
@@ -475,7 +484,7 @@ struct hybrid_server_object *get_handle_hybrid_obj( struct process *process,
     }
     obj = entry->ptr;
 
-    if (!type_is_hybrid_object(obj))
+    if (!type_is_shared_object(obj))
     {
         set_error( STATUS_OBJECT_TYPE_MISMATCH );  /* not the right type */
         return NULL;
@@ -639,9 +648,11 @@ obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, str
 }
 
 /* open a new handle to an existing object */
-obj_handle_t open_object( struct process *process, obj_handle_t parent, unsigned int access,
-                          const struct object_ops *ops, const struct unicode_str *name,
-                          unsigned int attributes )
+/* if obj_ret is non-null, caller must release object */
+obj_handle_t open_polytype_object( struct process *process, obj_handle_t parent,
+                                   unsigned int access, const struct object_ops *const ops[],
+                                   size_t ops_size, const struct unicode_str *name,
+                                   unsigned int attr, struct object **obj_ret )
 {
     obj_handle_t handle = 0;
     struct object *obj, *root = NULL;
@@ -661,10 +672,13 @@ obj_handle_t open_object( struct process *process, obj_handle_t parent, unsigned
         if (!root) return 0;
     }
 
-    if ((obj = open_named_object( root, ops, name, attributes )))
+    if ((obj = open_named_polytype_object( root, ops, ops_size, name, attr )))
     {
-        handle = alloc_handle( process, obj, access, attributes );
-        release_object( obj );
+        handle = alloc_handle( process, obj, access, attr );
+        if (obj_ret)
+            *obj_ret = obj;
+        else
+            release_object( obj );
     }
     if (root) release_object( root );
     return handle;

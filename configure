@@ -15706,6 +15706,7 @@ for ac_func in \
 	dlopen \
 	epoll_create \
 	ffs \
+	ffsl \
 	finitef \
 	fnmatch \
 	fork \

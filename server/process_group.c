@@ -1,5 +1,5 @@
 /*
- * Management of shared memory objects shared amongst groups of processes
+ * Management of shared memory objects amongst groups of processes
  *
  * Copyright (C) 2015-2016 Daniel Santos
  *
@@ -38,12 +38,23 @@
 #include "thread.h"
 #include "handle.h"
 #include "file.h"
-#include "pretty_dump.h"
+#ifdef DEBUG_OBJECTS
+# include "wine/pretty_dump.h"
+#endif
 
 
+/* All living process groups.  */
 static struct list all_process_groups = LIST_INIT(all_process_groups);
+
+/* Where process groups go when they die but still have orphans.  */
+static struct list limbo = LIST_INIT(limbo);
+
+/* Where objects go until all clients free their shared memory.  */
 static struct list orphanage = LIST_INIT(orphanage);
-static int create_orphan_or_free( struct hybrid_server_object *hso, struct process *process,
+
+static void process_group_dec_refcount( struct process_group *pg );
+static int create_orphan_or_free( struct hybrid_server_object *hso, void *ptr,
+                                  struct process_group *pg, struct process *process,
                                   obj_handle_t handle, enum pg_event event );
 static int release_orphans( struct hybrid_server_object *hso, struct process* process,
                             struct process_group *pg, obj_handle_t handle, enum pg_event event );
@@ -56,7 +67,9 @@ struct process_group global_process_group =
     {NULL, NULL},                               /* entry */
     LIST_INIT( global_process_group.objects ),  /* objects */
     TRUE,                                       /* global */
+    TRUE,                                       /* alive */
     0,                                          /* size */
+    0,                                          /* refcount */
     {NULL}                                      /* processes */
 };
 
@@ -85,6 +98,11 @@ static struct shm_cache *alloc_cache( size_t initial_size )
                            SHM_CACHE_POISON | SHM_CACHE_PAD | SHM_CACHE_VERIFY_MEM);
 }
 
+
+/*****************************************************************************
+ *              process_group member functions
+ */
+
 /* create a composite process group for multiple processes sharing objects */
 static struct process_group *process_group_create( struct process *processes[], size_t size,
                                                    size_t initial_size )
@@ -103,8 +121,10 @@ static struct process_group *process_group_create( struct process *processes[], 
         return NULL;
     }
 
-    pg->global = 0;
-    pg->size   = size;
+    pg->global   = 0;
+    pg->alive    = 1;
+    pg->size     = size;
+    pg->refcount = 0;
 
     list_add_tail(&all_process_groups, &pg->entry);
     list_init( &pg->objects );
@@ -115,7 +135,7 @@ static struct process_group *process_group_create( struct process *processes[], 
     return pg;
 }
 
-/* this could be optimized using a hashtable & hashing the process IDs, but it probably doesn't matter. */
+/* This could be optimized using a hashtable & hashing the process IDs, but it probably doesn't matter. */
 static struct process_group *process_group_find(struct process *processes[], size_t count)
 {
     struct process_group *pg;
@@ -139,7 +159,7 @@ continue_outer:
     return NULL;
 }
 
-/* find or create an appropriate process group */
+/* Find or create an appropriate process group.  */
 static struct process_group *process_group_find_or_create( struct process_group *prototype,
                                                            struct process *process, int remove )
 {
@@ -159,7 +179,7 @@ static struct process_group *process_group_find_or_create( struct process_group 
     if (!processes)
         return NULL;
 
-    /* copy process pointer array */
+    /* Copy process pointer array.  */
     if (prototype)
     {
         size_t i;
@@ -191,6 +211,7 @@ static struct process_group *process_group_find_or_create( struct process_group 
     return pg;
 }
 
+
 /******************************************************************************
  *              process_group_manage_object
  *
@@ -218,13 +239,14 @@ int process_group_manage_object( struct hybrid_server_object *hso, struct proces
     struct process_group *from = hso->process_group;
     struct process_group *to;
     struct shm_object_info info;
+    union shm_sync_value *old_shm;
     int in_new_group;
+    int ret;
 
     assert( hso );
     assert( process );
-    assert( !hybrid_object_is_server_private( &hso->any.ho ) );
 
-//fprintf(stderr, "%s\n", __func__);
+    shm_sync_trace("%s: process = %p, hso = %p, value = %p\n", __func__, process, hso, hso->any.ho.atomic.value);
 
     if (from)
     {
@@ -246,7 +268,7 @@ int process_group_manage_object( struct hybrid_server_object *hso, struct proces
         {
             assert( hso->obj.handle_count == 1 );
             assert( remove );
-            return process_group_obj_remove( hso, process, handle, event );
+            return process_group_obj_remove( hso, process, handle, event, NULL );
         }
     }
 
@@ -255,20 +277,22 @@ int process_group_manage_object( struct hybrid_server_object *hso, struct proces
     assert( remove ? !in_new_group : in_new_group );
 
     /* get new shared memory for object to migrate to */
-    shm_object_info_init( &info );
+    info = shm_object_info_init( );
     if ( !shm_cache_obj_alloc( to->cache, &info ) )
         return -1;
 
+    old_shm = hso->any.ho.atomic.value;
     if (hybrid_server_object_migrate( hso, &info ))
     {
         shm_cache_obj_free( to->cache, &info.ptr );
         return -1;
     }
 
-    list_remove( &hso->entry );
-    list_add_tail( &to->objects, &hso->entry );
-    hso->process_group = to;
-    return 0;
+    ret = process_group_obj_remove( hso, process, handle, event, old_shm );
+    process_group_obj_add( to, hso, handle, &info, FALSE );
+    assert (hso->any.ho.atomic.value);
+    process_group_check_sanity( hso );
+    return ret;
 }
 
 /******************************************************************************
@@ -276,18 +300,13 @@ int process_group_manage_object( struct hybrid_server_object *hso, struct proces
  *
  * obj->ops->close() handler for all hybrid objects
  *
- *
+ * Returns 1 if OK to close, zero otherwise.
  */
 int process_group_close_handle( struct object *obj, struct process *process, obj_handle_t handle )
 {
     struct hybrid_server_object *hso = (void*)obj;
 
-// fprintf(stderr, "%s\n", __func__);
-    assert( type_is_hybrid_object( obj ) );
-
-    if (hybrid_object_is_server_private( &hso->any.ho ))
-        return 1;
-
+    assert( type_is_shared_object( obj ) );
     assert( hso->process_group );
     if ( hso->process_group->global )
     {
@@ -330,45 +349,50 @@ static int object_in_group( struct hybrid_server_object *hso )
     return 0;
 }
 
-
+/*
+ *
+ * If this object was already moved then old_shm should point to the shared memory previously used.
+ */
 int process_group_obj_remove( struct hybrid_server_object *hso, struct process *process,
-                              obj_handle_t handle, enum pg_event event )
+                              obj_handle_t handle, enum pg_event event, void *old_shm )
 {
-    void *ptr                   = hso->any.ho.value;
+    void *ptr                   = old_shm ? old_shm : hso->any.ho.atomic.value;
     struct process_group *pg    = hso->process_group;
-    //struct shm_object_info info = shm_object_info_init( &info );
+    int ret = 0;
 
+    shm_sync_trace("%s: process = %p, hso = %p, value = %p\n", __func__, process, hso, hso->any.ho.atomic.value);
 //fprintf(stderr, "%s\n", __func__);
-    assert( !hybrid_object_is_server_private( &hso->any.ho ) );
     assert( pg );
-
-    if (shm_cache_have_ptr( pg->cache, ptr ) == -1 )
-        return -1;
-
+    assert( shm_cache_have_ptr( pg->cache, ptr ) );
     assert( object_in_group( hso ) );
 
     list_remove( &hso->entry );
-    memset( &hso->entry, 0x55, sizeof(hso->entry) );
+    hso->entry.prev    = NULL;
+    hso->entry.next    = NULL;
+    hso->any.ho.atomic.value  = NULL;
+    assert( pg->refcount );
 
-    /* is this the last object in the group? */
+#if 0
+    /* destroy process group when last object is removed */
     if (list_empty( &pg->objects ))
     {
+        /* no orphan needed */
         shm_cache_obj_free( pg->cache, &ptr );
-        hso->any.ho.value = NULL;
-        /* we don't need an orphan then, we can free the group */
         process_group_destroy( pg );
-        return 0;
     }
-
-    if (event == PG_EVENT_TERM && pg->size == 1)
-        /* don't create orphans for this case either */
-        return 0;
-
-    if (create_orphan_or_free( hso, process, handle, event ))
-        return -1;
+    else
+#endif
+    if (event == PG_EVENT_OBJ_DESTROY)
+    {
+        shm_cache_obj_free( pg->cache, &ptr );
+        process_group_dec_refcount( pg );
+    }
+    else
+        ret = create_orphan_or_free( hso, ptr, pg, process, handle, event );
 
     hso->process_group = NULL;
-    return 0;
+
+    return ret;
 }
 
 void process_group_get_info( struct hybrid_server_object *hso, struct shm_object_info *info )
@@ -379,15 +403,26 @@ void process_group_get_info( struct hybrid_server_object *hso, struct shm_object
     assert( hso );
     assert( hso->process_group );
     assert( info );
-    assert( !hybrid_object_is_server_private( &hso->any.ho ) );
-    result = shm_cache_get_info( hso->process_group->cache, hso->any.ho.value, info );
+    result = shm_cache_get_info( hso->process_group->cache, hso->any.ho.atomic.value, info );
     assert( result != -1 ); /* the only failure here can be due to a bug in wineserver */
+}
+
+static void process_group_dec_refcount( struct process_group *pg )
+{
+    /* WORKAROUND: This is a work-around for the current 1.9.0 staging not destroying process
+     * objects.  In future, we prefer to not destroy the object if it is still "alive", but rather
+     * stick a timer on it and collect it if it isn't used after a while.  */
+    if (--pg->refcount/* || pg->alive*/)
+        return;
+
+    assert( list_has( &limbo, &pg->entry ) || list_has( &all_process_groups, &pg->entry ) );
+    process_group_destroy( pg );
 }
 
 /******************************************************************************
  *              process_group_term
  *
- * Mange termination of a process within a process group
+ * Mange termination of a process within a group.
  *
  * Iterate through all process groups to find the ones we belong to and notify them that we've
  * terminated.
@@ -398,31 +433,44 @@ void process_group_term( struct process *process )
     struct process_group *pg_next;
     struct hybrid_server_object *hso;
 
-//fprintf(stderr, "%s\n", __func__);
+    shm_sync_trace("%s: process = %p\n", __func__, process);
+
     /* find all groups that process is a member of */
     LIST_FOR_EACH_ENTRY_SAFE(pg, pg_next, &all_process_groups, struct process_group, entry)
     {
-        struct hybrid_server_object *hso_last;
         int process_index = get_process_index( pg, process );
         if (process_index == -1)
             continue;
 
-        hso_last = LIST_ENTRY( list_tail( &pg->objects ), struct hybrid_server_object, entry );
         /* otherwise, we will migrate them to a process group minus the current process */
         while (!list_empty( &pg->objects ))
         {
             hso = LIST_ENTRY( list_head( &pg->objects ), struct hybrid_server_object, entry );
             process_group_manage_object( hso, process, 0, TRUE, PG_EVENT_TERM );
+        }
 
-            /* process group will self-destruct after the last object is removed, so we have to exit
-             * the loop */
-            if (hso == hso_last)
-                break;
+        assert( list_empty( &pg->objects ) );
+        if (pg->size == 1)
+        {
+            assert( pg->processes[0] == process );
+            assert( pg->refcount == 0 );
+            process_group_destroy( pg );
+        } else {
+            /* Kill the process group and move it to limbo.  */
+            pg->alive = 0;
+            pg->processes[process_index] = NULL;
+            list_remove( &pg->entry );
+            list_add_tail( &limbo, &pg->entry );
         }
     }
-    //release_orphans( NULL, process, PG_EVENT_TERM );
-}
 
+    LIST_FOR_EACH_ENTRY_SAFE(pg, pg_next, &limbo, struct process_group, entry)
+    {
+        int process_index = get_process_index( pg, process );
+        if (process_index >= 0)
+            pg->processes[process_index] = NULL;
+    }
+}
 
 
 /******************************************************************************
@@ -444,23 +492,23 @@ void process_group_term( struct process *process )
  */
 
 int process_group_get_new_release_old( struct hybrid_server_object *hso, struct process *process,
-                                       obj_handle_t handle, struct shm_object_info *info )
+                                       obj_handle_t handle, struct shm_object_info *info, int release_old )
 {
+    //struct shm_object_info existing = shm_object_info_init( );
     struct process_group *pg;
 
-//fprintf(stderr, "%s\n", __func__);
     assert( hso );
     assert( hso->process_group );
     assert( process );
-    assert( !hybrid_object_is_server_private( &hso->any.ho ) );
 
     pg = hso->process_group;
 
     if (info)
     {
-        int obj_index = shm_cache_get_info( pg->cache, hso->any.ho.value, info );
+        int obj_index = shm_cache_get_info( pg->cache, hso->any.ho.atomic.value, info );
         assert( obj_index >= 0 );   /* can only fail due to bug in wineserver */
     }
+
 if (pg->global)
 {
     fprintf(stderr, "WARNING: global handles not yet properly supported\n");
@@ -484,24 +532,26 @@ fprintf(stderr, "%s: %s\n", __func__, buf);
 
 /* add an object to a process group, allocate some shared memory and return that info */
 int process_group_obj_add( struct process_group *pg, struct hybrid_server_object *hso,
-                           obj_handle_t handle, struct shm_object_info *info )
+                           obj_handle_t handle, struct shm_object_info *info, int allocate_shm )
 {
-    assert( !hso->process_group );
+    assert( !allocate_shm || !hso->process_group );
+    shm_sync_trace("%s\n", __func__);
 
-//fprintf(stderr, "%s\n", __func__);
     if (!pg)
     {
         assert( current );
         pg = process_group_find_or_create( NULL, current->process, FALSE );
     }
 
-    if (!shm_cache_obj_alloc( pg->cache, info ))
+    if (allocate_shm && !shm_cache_obj_alloc( pg->cache, info ))
         return -1;
 
-//assert( ((unsigned long)hso->entry.prev & 0xfffffffful) == 0x55555555ul );
-//assert( ((unsigned long)hso->entry.next & 0xfffffffful) == 0x55555555ul );
+    hso->any.ho.atomic.value = info->ptr;
+    hso->any.ho.hash_base    = info->hash_base;
+    assert (hso->any.ho.atomic.value);
     list_add_tail( &pg->objects, &hso->entry );
     hso->process_group = pg;
+    ++pg->refcount;
     return 0;
 }
 
@@ -520,23 +570,23 @@ struct orphan
 };
 
 /* create an orphan (if there are still references) or free the shared memory */
-static int create_orphan_or_free( struct hybrid_server_object *hso, struct process *process,
+static int create_orphan_or_free( struct hybrid_server_object *hso, void *ptr,
+                                  struct process_group *pg, struct process *process,
                                   obj_handle_t handle, enum pg_event event )
 {
-    void *ptr                   = hso->any.ho.value;
-    struct process_group *pg    = hso->process_group;
-    unsigned int refcount       = 0;
+    unsigned int refcount = 0;
     struct orphan *orphan;
     size_t i;
 
     if (!hso->obj.handle_count)
-    {
-        shm_cache_obj_free( pg->cache, &ptr );
-    }
+        goto free_obj;
 
     orphan = mem_alloc(sizeof(*orphan) + sizeof(orphan->refcount[0]) * (pg->size - 1));
     if (!orphan)
+    {
+        fprintf(stderr, "wineserver: ERROR %s: failed to create orphan for object %p\n", __func__, hso);
         return -1;
+    }
 
     orphan->hso = hso;
     orphan->pg  = pg;
@@ -547,7 +597,8 @@ static int create_orphan_or_free( struct hybrid_server_object *hso, struct proce
 
     for (i = 0; i < pg->size; ++i)
     {
-        unsigned int count  = count_handles( &hso->obj, pg->processes[i], handle );
+        obj_handle_t process_handle = (process == pg->processes[i]) ? handle : 0;
+        unsigned int count  = count_handles( &hso->obj, pg->processes[i], process_handle );
         orphan->refcount[i] = count;
         refcount           += count;
     }
@@ -557,7 +608,9 @@ static int create_orphan_or_free( struct hybrid_server_object *hso, struct proce
     else
     {
         free( orphan );
+free_obj:
         shm_cache_obj_free( pg->cache, &ptr );
+        process_group_dec_refcount( pg );
     }
 
     return 0;
@@ -566,13 +619,16 @@ static int create_orphan_or_free( struct hybrid_server_object *hso, struct proce
 static void orphan_destroy( struct orphan *orphan )
 {
     size_t size = sizeof(*orphan) + sizeof(orphan->refcount[0]) * (orphan->pg->size - 1);
+    struct process_group *pg = orphan->pg;
     int result;
+
     list_remove( &orphan->entry );
     /* shm object can be safely reused now */
-    result = shm_cache_obj_free( orphan->pg->cache, &orphan->ptr );
+    result = shm_cache_obj_free( pg->cache, &orphan->ptr );
     assert( !result );
     memset( orphan, 0xaa, size );
     free( orphan );
+    process_group_dec_refcount( pg );
 }
 
 #if 0
@@ -603,14 +659,12 @@ static void release_orphan(struct orphan *orphan, int process_index, obj_handle_
         switch (event)
         {
         case PG_EVENT_OBJ_CLOSE:
-            assert( *refcount > 0 );
-            /* we need to get the count from handle table */
-            --*refcount; // = count_handles( &orphan->hso->obj, orphan->pg->processes[process_index], handle);
-            break;
-
         case PG_EVENT_OBJ_RELEASE:
-            assert( *refcount > 0 );
-            --*refcount;
+            /* it's possible to get here when refcount is already zero because the process did
+             * release, but later called NtClose() on the object, but other processes haven't
+             * released it yet. */
+            if (*refcount)
+                --*refcount;
             break;
 
         case PG_EVENT_OBJ_DESTROY:
@@ -641,6 +695,8 @@ static int release_orphans( struct hybrid_server_object *hso, struct process *pr
     struct orphan *next;
     unsigned int ret = 0;
 
+    shm_sync_trace("%s: hso = %p, process = %p, event = %d\n", __func__, hso, process, event);
+
     LIST_FOR_EACH_ENTRY_SAFE(orphan, next, &orphanage, struct orphan, entry)
     {
         unsigned int process_index = get_process_index( orphan->pg, process );
@@ -664,21 +720,7 @@ static int release_orphans( struct hybrid_server_object *hso, struct process *pr
                 if (orphan->pg != pg)
                     continue;
                 break;
-#if 0
-            /* Client responding to a migration, release all orphans for this
-             * process */
-            case PG_EVENT_MIGRATE:
-                if (process_index == -1 || orphan->released[process_index])
-                    continue;
-                /* intentional fall-through */
 
-            /* Object now being destroyed */
-            case PG_EVENT_DESTROY:
-                if (hso != orphan->hso)
-                    continue;
-                /* intentional fall-through */
-            case PG_EVENT_COUNT:; /* quite warning */
-#endif
             default:
                 assert(0);
                 continue;
@@ -750,7 +792,7 @@ void process_group_dump( struct dump *dump, struct process_group *pg, enum proce
         dump_printf(dump, "}\n%sobjects      = {", dump->indent);
         LIST_FOR_EACH_ENTRY(hso, &pg->objects, const struct hybrid_server_object, entry)
         {
-            dump_printf(dump, "%s%p (shm = %p)", i++ ? ", " : "", hso, hso->any.ho.value);
+            dump_printf(dump, "%s%p (shm = %p)", i++ ? ", " : "", hso, hso->any.ho.atomic.value);
         }
     }
     else
@@ -795,5 +837,42 @@ void process_groups_dump( struct process *process, enum process_group_dump_flags
         }
     }
 }
-#endif
+
+__attribute__((optimize(2)))
+void process_group_check_sanity( struct hybrid_server_object *hso )
+{
+    struct process_group *pg = hso->process_group;
+    struct list *i;
+
+    assert( hso->obj.ops->trywait_begin_trans );
+    assert( pg );
+
+    /* Make sure process group is in "all groups" list.  */
+    LIST_FOR_EACH(i, &all_process_groups)
+        if (i == &pg->entry)
+            break;
+    assert( i != &all_process_groups );
+
+    /* Verify that this object is in the process group's object list.  */
+    LIST_FOR_EACH(i, &pg->objects)
+        if (i == &hso->entry)
+            break;
+    assert( i != &pg->objects );
+
+    /* Verify that the object's shared memory is from the correct cache.  */
+    shm_cache_have_ptr( pg->cache, hso->any.ho.atomic.value );
+
+}
+
+size_t process_group_count_living( void )
+{
+    return list_count( &all_process_groups );
+}
+
+size_t process_group_count_limbo( void )
+{
+    return list_count( &limbo );
+}
+
+#endif /* DEBUG_OBJECTS */
 

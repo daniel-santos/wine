@@ -24,7 +24,6 @@ C_SRCS = \
 	mutex.c \
 	named_pipe.c \
 	object.c \
-	pretty_dump.c \
 	process.c \
 	process_group.c \
 	procfs.c \
@@ -55,5 +54,6 @@ MANPAGES = \
 	wineserver.man.in
 
 EXTRALIBS = $(LDEXECFLAGS) -lwine $(POLL_LIBS) $(RT_LIBS)
+CFLAGS += -DWINESERVER=1
 
 INSTALL_LIB = $(PROGRAMS)

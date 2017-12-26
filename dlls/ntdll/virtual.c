@@ -3486,7 +3486,7 @@ static NTSTATUS map_shared_memory( struct file_view **view_ptr, int fd, void *ad
         int prot;
 
         prot = VIRTUAL_GetUnixProt( vprot );
-        if (force_exec_prot && !(vprot & VPROT_NOEXEC) && (vprot & VPROT_READ))
+        if (force_exec_prot && (vprot & VPROT_READ))
         {
             TRACE( "forcing exec permission on mapping %p-%p\n",
                    (char *)view->base, (char *)view->base + size - 1 );
@@ -3497,7 +3497,7 @@ static NTSTATUS map_shared_memory( struct file_view **view_ptr, int fd, void *ad
 //fprintf(stderr, "%s: mmap(%p, %zu, %08x, %08x, %d, 0)\n", __func__, view->base, size, prot, MAP_FIXED | MAP_SHARED, fd);
 
         if (mmap( view->base, size, prot, MAP_FIXED | MAP_SHARED, fd, 0 ) != (void *)-1)
-            memset( view->prot, vprot, pages );
+            ;
         else
         {
             perror( "mmap" );
@@ -3603,13 +3603,14 @@ VIRTUAL_DumpView( shm->view );
  *  various other errors can return from map_shared_memory(), map_view(), etc.
  */
 NTSTATUS virtual_get_shared_memory( struct shared_memory_block **shm_ptr,
-                                    struct shm_object_info *info, int vprot )
+                                    struct shm_object_info *info )
 {
     NTSTATUS ret;
     sigset_t sigset;
     struct shared_memory_block *i;
     struct shared_memory_block *shm = NULL;
     const size_t min_size = info->offset + sizeof(union shm_sync_value);
+    const unsigned int vprot = VPROT_READ | VPROT_WRITE | VPROT_COMMITTED;
 
     assert( info->shm_id );
 
@@ -3638,7 +3639,8 @@ NTSTATUS virtual_get_shared_memory( struct shared_memory_block **shm_ptr,
         assert( info->size >= page_size );
         assert( !(info->size % page_size) );
 
-        shm = RtlAllocateHeap( virtual_heap, 0, sizeof(*shm) );
+        /* FIXME: OK to use this heap?  */
+        shm = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*shm) );
         if (!shm)
             return STATUS_NO_MEMORY;
 
@@ -3650,7 +3652,7 @@ NTSTATUS virtual_get_shared_memory( struct shared_memory_block **shm_ptr,
         if (ret)
         {
             ERR("map_shared_memory failed with %08x\n", ret);
-            RtlFreeHeap( virtual_heap, 0, shm );
+            RtlFreeHeap( GetProcessHeap(), 0, shm );
             return ret;
         }
 
@@ -3685,7 +3687,7 @@ static struct shared_memory_block *find_shm_block( const char *ptr )
     {
         const char *start = i->view->base;
         const char *end   = start + i->view->size;
-        if (ptr >= start && ptr <= end)
+        if (ptr >= start && ptr < end)
             return i;
     }
 
@@ -3700,18 +3702,52 @@ void virtual_release_shared_memory( void *addr )
     server_enter_uninterrupted_section( &csVirtual, &sigset );
     if ((shm = find_shm_block( addr )))
     {
-        //--shm->refcount;
+        --shm->refcount;
 
 //fprintf(stderr, "\n\n###########################%s: %p refcount = %d (ptr = %p)\n", __func__, shm, shm->refcount, addr);
         assert(shm->refcount >= 0);
-        if (0 && shm->refcount == 0)
+        if (shm->refcount == 0)
         {
 //fprintf(stderr, "%s: removing %p\n", __func__, shm);
             list_remove( &shm->entry );
             unmap_area( shm->view->base, shm->view->size );
             delete_view( shm->view );
-            RtlFreeHeap( virtual_heap, 0, shm );
+            RtlFreeHeap( GetProcessHeap(), 0, shm );
         }
     }
     server_leave_uninterrupted_section( &csVirtual, &sigset );
+}
+
+SIZE_T virtual_shared_memory_dumpeth( struct shm_dbg **p, HANDLE heap )
+{
+    struct shared_memory_block *shm;
+    sigset_t sigset;
+    size_t count = 0, refs = 0, i = 0;
+
+    server_enter_uninterrupted_section( &csVirtual, &sigset );
+    LIST_FOR_EACH_ENTRY( shm, &shared_memory_blocks, struct shared_memory_block, entry )
+    {
+        fprintf( stderr, "%-8u %p %zu\n", shm->refcount, shm->view->base, shm->view->size  );
+        ++count;
+        refs += shm->refcount;
+    }
+
+    if (p)
+    {
+        *p = RtlAllocateHeap( heap, 0, sizeof(struct shm_dbg) * count );
+        if (!*p)
+            return count;
+        LIST_FOR_EACH_ENTRY( shm, &shared_memory_blocks, struct shared_memory_block, entry )
+        {
+            (*p)[i].base     = shm->view->base;
+            (*p)[i].size     = shm->view->size;
+            (*p)[i].refcount = shm->refcount;
+            ++i;
+        }
+    }
+
+    server_leave_uninterrupted_section( &csVirtual, &sigset );
+
+    fprintf( stderr, "TOTAL: %zu shared memory blocks, %zu references\n", count, refs);
+    return count;
 }

@@ -46,7 +46,7 @@
 #include "winternl.h"
 #include "ntdll_misc.h"
 #include "wine/server.h"
-
+#include "wine/rbtree.h"
 #include "wine/sync.h"
 #include "wine/sync_impl_client.h"
 
@@ -66,22 +66,46 @@ static __cold void rwlock_fail( const char *op, int err, const char *file, unsig
     assert(err);
 }
 
-static inline void __rwlock_begin_read( pthread_rwlock_t *rwlock, sigset_t *sigset, const char *file, unsigned line )
+static void __rwlock_begin_read( pthread_rwlock_t *rwlock, sigset_t *sigset, const char *file, unsigned line )
 {
     int ret;
+    struct timespec timeout;
+
+    timeout.tv_sec = 4;
+    timeout.tv_nsec = 0;
+
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
-    ret = pthread_rwlock_rdlock( rwlock );
+    do {
+        ret = pthread_rwlock_timedrdlock( rwlock, &timeout );
+        if (ret == ETIMEDOUT)
+        {
+            ERR("timeout\n");
+            continue;
+        }
+    } while (0);
     if (ret)
-        rwlock_fail( "pthread_rwlock_rdlock", ret, file, line );
+        rwlock_fail( "pthread_rwlock_timedrdlock", ret, file, line );
 }
 
-static inline void __rwlock_begin_write( pthread_rwlock_t *rwlock, sigset_t *sigset, const char *file, unsigned line )
+static void __rwlock_begin_write( pthread_rwlock_t *rwlock, sigset_t *sigset, const char *file, unsigned line )
 {
     int ret;
+    struct timespec timeout;
+
+    timeout.tv_sec = 4;
+    timeout.tv_nsec = 0;
+
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
-    ret = pthread_rwlock_wrlock( rwlock );
+    do {
+        ret = pthread_rwlock_timedwrlock( rwlock, &timeout );
+        if (ret == ETIMEDOUT)
+        {
+            ERR("timeout\n");
+            continue;
+        }
+    } while (0);
     if (ret)
-        rwlock_fail( "pthread_rwlock_wrlock", ret, file, line );
+        rwlock_fail( "pthread_rwlock_timedwrlock", ret, file, line );
 }
 
 static inline void __rwlock_end( pthread_rwlock_t *rwlock, sigset_t *sigset, const char *file, unsigned line )
@@ -195,7 +219,7 @@ static inline void __rwlock_end( pthread_rwlock_t *rwlock, sigset_t *sigset, con
 static __thread char *tls_debug_buffer = NULL;
 #define NTDLL_DEBUG_BUFFER_SIZE 0x400
 
-static const char * const obj_type_desc[NTDLL_OBJ_TYPE_ID_MAX] = {
+static const char *const obj_type_desc[NTDLL_OBJ_TYPE_ID_MAX] = {
     "async I/O",                                /* NTDLL_OBJ_TYPE_ID_ASYNC */
     "event",                                    /* NTDLL_OBJ_TYPE_ID_EVENT */
     "I/O completion ports",                     /* NTDLL_OBJ_TYPE_ID_COMPLETION */
@@ -251,16 +275,16 @@ static struct {
  *
  */
 
-NTSTATUS ntdll_object_new(struct ntdll_object **dest, const HANDLE h, size_t size,
-                          struct ntdll_object_type *type, struct shm_object_info *info)
+NTSTATUS ntdll_object_new( struct ntdll_object **dest, const HANDLE h, size_t size,
+                           struct ntdll_object_type *type, struct shm_object_info *info )
 {
     struct ntdll_object *obj;
     sigset_t sigset;
     NTSTATUS ret;
 
-    assert(size >= sizeof(*obj));
-    assert(type->id < NTDLL_OBJ_TYPE_ID_MAX);
-
+    assert( size >= sizeof(*obj) );
+    assert( type->id < NTDLL_OBJ_TYPE_ID_MAX );
+#if 0
     if (TRACE_ON(ntdllobj))
     {
         char buf[0x400];
@@ -268,12 +292,10 @@ NTSTATUS ntdll_object_new(struct ntdll_object **dest, const HANDLE h, size_t siz
         shm_object_info_dump(info, &start, &buf[0x400]);
         //TRACE_(ntdllobj)
         fprintf(stderr, "%p, %zu, %u (%s), %p, info = %s\n", h, size, type->id,
-                          obj_type_desc[type->id], type, buf);
+                obj_type_desc[type->id], type, buf);
     }
-
-    assert(!(info->flags & HYBRID_SYNC_SERVER_PRIVATE));
-
-    obj = RtlAllocateHeap(GetProcessHeap(), 0, size);
+#endif
+    obj = RtlAllocateHeap( GetProcessHeap(), HEAP_CREATE_ALIGN_16, size );
     if (!obj)
     {
         ERR_(ntdllobj)("Failed to alloc %zu bytes\n", sizeof(*obj));
@@ -283,22 +305,28 @@ NTSTATUS ntdll_object_new(struct ntdll_object **dest, const HANDLE h, size_t siz
 
     memset(obj, 0x55, size);
 
-    obj->type       = type;
-    obj->h          = h;
-//    obj->shm        = NULL;
-
-    /* will this object use shared memory? */
-    if (!(info->flags & HYBRID_SYNC_SERVER_PRIVATE))
+    obj->type    = type;
+    obj->h       = h;
+    obj->private = info->private;
+//
+    if (info->private)
+    {
+#if 0
+        info->ptr       = NULL;
+        info->hash_base = 0;
+        info->offset    = 0;
+#endif
+    }
+    else
     {
         info->ptr = NULL;
-        ret = server_get_object_shared_memory(h, info);
+        ret = server_get_object_shared_memory( h, info );
 
         if (ret || !info->ptr)
         {
             ERR_(ntdllobj)("server_get_object_shared_memory returned %08x\n", ret);
             goto exit_error;
         }
-        info->hash_base = fnv1a_hash32( FNV1A_32_INIT, info->hash_base_in, sizeof (info->hash_base_in) );
 if (0)
 {
     char buf[0x400];
@@ -308,16 +336,9 @@ if (0)
     fprintf(stderr, "%s: %p, %zu, %u (%s), %p, info = %s\n", __func__, h, size, type->id,
                         obj_type_desc[type->id], type, buf);
 }
-
-    }
-    else
-    {
-        info->ptr       = NULL;
-        info->hash_base = 0;
-        info->offset    = 0;
+        hybrid_object_init( &obj->any.ho, info );
     }
 
-    hybrid_object_init(&obj->any.ho, info->ptr, info->flags, info->hash_base);
 if (0)
 {
     char buf[0x400];
@@ -337,42 +358,39 @@ if (0)
     return STATUS_SUCCESS;
 
 exit_error:
-    RtlFreeHeap(GetProcessHeap(), 0, obj);
+    RtlFreeHeap( GetProcessHeap(), 0, obj );
     *dest = NULL;
     return ret;
 }
 
 /* This is a hook to give the object a chance to do anything special that needs
  * to happen when the shared memory portion of the object is moved */
-static NTSTATUS ntdll_object_move(struct hybrid_sync_object *ho)
+static NTSTATUS ntdll_object_move(struct hybrid_sync_object *ho, struct shm_object_info *info)
 {
-    struct ntdll_object *obj    = LIST_ENTRY(ho, struct ntdll_object, any);
-    struct shm_object_info info = shm_object_info_init( &info );
+    /* upcast */
+    struct ntdll_object *obj = LIST_ENTRY(ho, struct ntdll_object, any);
+    void *old_ptr = ho->atomic.value;
     NTSTATUS result;
 
-    info.ptr    = NULL; /* let virtual.c decide where to put it */
-    info.shm_id = 0;    /* we need the new location */
+    info->ptr    = NULL; /* let virtual.c decide where to put it */
+    info->shm_id = 0;    /* we need the new location */
 
-    if ((result = server_get_object_shared_memory(obj->h, &info)))
-    {
-        ho->value     = NULL;
-        ho->hash_base = 0;
+    if ((result = server_get_object_shared_memory(obj->h, info)))
         RtlSetLastWin32ErrorAndNtStatusFromNtStatus(result);
-    }
-    else
-    {
-        ho->value     = info.ptr;
-        ho->hash_base = fnv1a_hash32( FNV1A_32_INIT, info.hash_base_in, sizeof (info.hash_base_in) );
-    }
-if (0)
+
+    if (old_ptr)
+        virtual_release_shared_memory(old_ptr);
+#if 0
+fprintf(stderr, "shm %p %08x %08x\n", info->ptr, ((union shm_sync_value*)info->ptr)->data, ((union shm_sync_value*)info->ptr)->flags_hash);
+if (1)
 {
 char buf[0x400];
 char *start = buf;
 const char *end = &buf[0x400];
-shm_object_info_dump( &info, &start, end);
+shm_object_info_dump( info, &start, end);
 fprintf(stderr, "%s: %s\n", __func__, buf);
 }
-
+#endif
     return result;
 }
 
@@ -380,10 +398,10 @@ static NTSTATUS ntdll_object_destroy(struct hybrid_sync_object *ho)
 {
     struct ntdll_object *obj = LIST_ENTRY(ho, struct ntdll_object, any);
     sigset_t sigset;
-//fprintf(stderr, "\n\n*************************************** %s: %p\n\n", __func__, ho);
-    /* accessible bit cleared and refcount == 0 */
-    assert(! ((ho->flags_refcount & HYBRID_SYNC_ACCESSIBLE)
-           || (ho->flags_refcount >> HYBRID_SYNC_FLAGS_BITS)));
+
+    assert( !(hso_atomic_get_flags( &ho->atomic ) & HYBRID_SYNC_ACCESSIBLE) );
+    assert( hso_atomic_get_refcount( &ho->atomic ) == 0 );
+    assert( hso_atomic_get_waitcount( &ho->atomic ) == 0 );
 
     TRACE_(ntdllobj)("Removing & freeing object %s\n", ntdll_object_dump(obj));
     rwlock_begin_write(&objects.rwlock, &sigset);
@@ -392,8 +410,8 @@ static NTSTATUS ntdll_object_destroy(struct hybrid_sync_object *ho)
     if (obj->type->close)
         obj->type->close(obj);
 
-    if (ho->value)
-        virtual_release_shared_memory(ho->value);
+    if (ho->atomic.value)
+        virtual_release_shared_memory(ho->atomic.value);
 
 //#if defined(DEBUG) || defined(DEBUG_OBJECTS)
     memset(obj, 0xaa, sizeof(struct ntdll_object));
@@ -401,6 +419,12 @@ static NTSTATUS ntdll_object_destroy(struct hybrid_sync_object *ho)
     RtlFreeHeap(GetProcessHeap(), 0, obj);
 
     return 0;
+}
+
+static void ntdll_object_server_wake(struct hybrid_sync_object *ho)
+{
+    struct ntdll_object *obj = LIST_ENTRY(ho, struct ntdll_object, any);
+    server_wake( obj->h );
 }
 
 /*************************************************************************
@@ -445,7 +469,7 @@ NTSTATUS __must_check ntdll_object_grab(struct ntdll_object *obj)
  */
 NTSTATUS __must_check ntdll_object_release(struct ntdll_object *obj)
 {
-    NTSTATUS ret = hybrid_object_release( &obj->any.ho );
+    NTSTATUS ret = hybrid_object_release( &obj->any.ho, FALSE );
     if (ret)
         ERR_(ntdllobj)("hybrid_object_release failed with %08x", ret);
 
@@ -592,6 +616,26 @@ const char *ntdll_object_dump(const struct ntdll_object *obj)
     return ret;
 }
 
+
+void ntdll_object_dump_by_handle(const HANDLE h)
+{
+    const char *ret = NULL;
+    struct ntdll_object *obj = ntdll_handle_find( h );
+    if (obj)
+    {
+	NTSTATUS result;
+	ret = ntdll_object_dump (obj);
+	result = ntdll_object_release (obj);
+	if (!result)
+	    fprintf(stderr, "ERROR: ntdll_object_release returned %d (0x%04x)\n", result, result);
+    }
+    else
+	ret = "ntdll object not found\n";
+
+    fputs(ret, stderr);
+    //return ret;
+}
+
 /* red-black tree functions for handle table */
 static inline void *ntdll_handle_rb_alloc(size_t size)
 {
@@ -615,7 +659,7 @@ static inline int ntdll_handle_compare(const void *key, const struct wine_rb_ent
 
     return *_a > *_b ? 1 : (*_a < *_b ? -1 : 0);
 }
-
+#if 0
 static const struct wine_rb_functions obj_handles_rb_ops =
 {
     ntdll_handle_rb_alloc,
@@ -623,13 +667,13 @@ static const struct wine_rb_functions obj_handles_rb_ops =
     ntdll_handle_rb_free,
     ntdll_handle_compare,
 };
-
+#endif
 /* Tree mapping all process-locally known kernel handles to a struct ntdll_object */
 static struct {
     struct wine_rb_tree tree;
     pthread_rwlock_t    rwlock;
 } handles = {
-    { &obj_handles_rb_ops, NULL, {NULL, 0, 0}}, /* static initializer to aid -findirect-inline */
+    { ntdll_handle_compare, NULL},
     PTHREAD_RWLOCK_INITIALIZER
 };
 
@@ -667,13 +711,21 @@ __attribute__((noinline)) NTSTATUS ntdll_handle_add(struct ntdll_object *obj)
     /* mark object HYBRID_SYNC_ACCESSIBLE */
     if (ret == 0)
     {
-        int accessible = hybrid_object_mark_accessible( &obj->any.ho, TRUE );
-        /* it shouldn't have previously been marked */
-        assert (!accessible);
+        //ret = hybrid_object_mark_accessible( &obj->any.ho, TRUE );
+	struct hybrid_sync_object *ho = &obj->any.ho;
+	union hso_atomic pre = ho->atomic;
+	//fprintf(stderr, "asdf flags_refcount %08x\n", ho->atomic.flags_refcount);
+	//assert (ho->atomic.flags_refcount >> 4 == 1);
+	ret = hso_client_op( ho, &pre, HSO_CLIENT_OP_LIST, NULL, NULL );
+
+	//if (!ret)
+//	    assert (ho->atomic.flags_refcount & HYBRID_SYNC_ACCESSIBLE);
+
     }
     rwlock_end(&handles.rwlock, &sigset);
+//    if (ret)
 
-    if (unlikely(ret == -1))
+    if (unlikely(ret))
     {
         /* FIXME: most of this is debugging stuff, probably remove it all */
         NTSTATUS result;
@@ -721,7 +773,8 @@ __attribute__((noinline))
 NTSTATUS ntdll_handle_remove(const HANDLE h)
 {
     struct ntdll_object *obj = ntdll_handle_find(h);
-    int accessible;
+    //NTSTATUS result, result_release;
+    //int accessible;
     sigset_t sigset;
 
     if (!obj)
@@ -730,16 +783,10 @@ NTSTATUS ntdll_handle_remove(const HANDLE h)
     TRACE_(ntdllobj)("h = %p, obj = %s\n", h, ntdll_object_dump(obj));
 
     rwlock_begin_write(&handles.rwlock, &sigset);
-    /* TODO: a more efficient wine_rb_remove_by_entry would be nice here */
-    wine_rb_remove(&handles.tree, &h);
+    wine_rb_remove(&handles.tree, &obj->tree_entry);
     rwlock_end(&handles.rwlock, &sigset);
 
-    accessible = hybrid_object_mark_accessible( &obj->any.ho, FALSE );
-
-    /* it should have previously been marked */
-    assert (accessible);
-
-    return ntdll_object_release(obj); /* release object (probably destroyed after this) */
+    return hybrid_object_release( &obj->any.ho, TRUE );
 }
 
 /*************************************************************************
@@ -776,6 +823,11 @@ struct ntdll_object *ntdll_handle_find(const HANDLE h)
     if (entry)
     {
         ret = WINE_RB_ENTRY_VALUE(entry, struct ntdll_object, tree_entry);
+
+        /* ntdll_object_grab is MT safe, but if we release the rwlock prior to grabbing the object
+         * then we'll have a race -- we could get preempted prior to grab completing and another
+         * thread calls NtClose() thereby removing it from the handle db and the object being
+         * destroyed while we still have a pointer to it. */
         if ((status = ntdll_object_grab(ret)))
             RtlSetLastWin32ErrorAndNtStatusFromNtStatus(status);
     }
@@ -785,6 +837,69 @@ struct ntdll_object *ntdll_handle_find(const HANDLE h)
 
     return status ? NULL : ret;
 }
+
+
+__attribute__((optimize(2)))
+static void ntdll_object_whose_use_cb(struct wine_rb_entry *entry, void *context)
+{
+    struct ntdll_object *obj = WINE_RB_ENTRY_VALUE(entry, struct ntdll_object, tree_entry);
+    size_t *nhandles = (size_t *)context;
+    if (!list_has( &objects.list, &obj->list_entry ))
+        WARN_(ntdllobj)("In handle tree, but not object list: %s\n", ntdll_object_dump(obj));
+//    unsigned refcount;
+
+    ++(*nhandles);
+}
+
+void ntdll_object_whose_use(void *ptr)
+{
+    size_t nhandles = 0;
+    size_t nobjects = 0;
+    size_t shm_count;
+    struct shm_dbg *shm_blocks;
+    struct ntdll_object *obj;
+    sigset_t sigset;
+    shm_count = virtual_shared_memory_dumpeth( &shm_blocks, GetProcessHeap() );
+
+    assert( shm_blocks ); //ENOMEM
+
+    TRACE_(ntdllobj)("\n");
+    rwlock_begin_read(&handles.rwlock, &sigset);
+    wine_rb_for_each_entry(&handles.tree, ntdll_object_whose_use_cb, &nhandles);
+    rwlock_end(&handles.rwlock, &sigset);
+
+#if 1
+    rwlock_begin_read(&objects.rwlock, &sigset);
+    //nobjects = list_count(&objects.list);
+
+    LIST_FOR_EACH_ENTRY( obj, &objects.list, struct ntdll_object , list_entry )
+    {
+        size_t i;
+        const char* p = *(const char* volatile*)&obj->any.ho.atomic.value;
+
+        ++nobjects;
+        for (i = 0; i < shm_count; ++i) {
+            const char *start = (const char*)shm_blocks[i].base;
+            const char *end = start + shm_blocks[i].size;
+            if (p >= start && p < end)
+            {
+                fprintf(stderr, "ntdll_object %p uses %p in block %p (size %u, refcount %u)\n",
+                        obj, p, shm_blocks[i].base, shm_blocks[i].size, shm_blocks[i].refcount);
+                break;
+            }
+        }
+        if (i == shm_count)
+            fprintf(stderr, "WARNING: not found ntdll_object %p using %p\n", obj, p);
+        //ERR_(ntdllobj)("Leaked object: %s\n", ntdll_object_dump(obj));
+    }
+    rwlock_end(&objects.rwlock, &sigset);
+
+    fprintf(stderr, "%zu objects, %zu handles\n\n", nobjects, nhandles);
+
+    RtlFreeHeap( GetProcessHeap(), 0, shm_blocks );
+#endif
+}
+
 
 
 /* callback for ntdll_objects_cleanup()
@@ -805,7 +920,7 @@ static void ntdll_objects_cleanup_cb(struct wine_rb_entry *entry, void *context)
     WARN_(ntdllobj)("Leaked object handle: %s\n", ntdll_object_dump(obj));
 
 #if 0
-    refcount = obj->any.ho.flags_refcount >> HYBRID_SYNC_FLAGS_BITS;
+    refcount = obj->any.ho.atomic.flags_refcount >> HYBRID_SYNC_FLAGS_BITS;
     if (refcount)
         ERR_(ntdllobj)("object %p has refcount = %\n", obj, refcount);
 
@@ -850,7 +965,21 @@ static void ntdll_objects_cleanup(void)
 }
 
 int shm_sync_enabled;
+#if 0
+typedef struct
+{
+    void           *unknown;    /* 00 unknown */
+    UNICODE_STRING *exe_name;   /* 04 exe module name */
 
+    /* the following fields do not exist under Windows */
+    UNICODE_STRING  exe_str;    /* exe name string pointed to by exe_name */
+    CURDIR          curdir;     /* current directory */
+    WCHAR           curdir_buffer[MAX_PATH];
+} WIN16_SUBSYSTEM_TIB;
+#endif
+
+
+extern char **__wine_main_argv;
 /*************************************************************************
  * ntdll_object_db_init
  *
@@ -866,9 +995,11 @@ NTSTATUS ntdll_object_db_init(void)
 {
     NTSTATUS ret = 0;
     sigset_t sigset;
-    shmglobal_t *shmglobal   = NtCurrentTeb()->Reserved5[0];
-    const char *shm_val      = getenv( "STAGING_SHARED_MEMORY" );
-    const char *shm_sync_val = getenv( "STAGING_SHM_SYNC" );
+/* FIXME: use something fucking standard.  */
+    shmglobal_t *shmglobal    = NtCurrentTeb()->Reserved5[1];
+    const char *shm_val       = getenv( "STAGING_SHARED_MEMORY" );
+    const char *shm_sync_val  = getenv( "STAGING_SHM_SYNC" );
+    const char *shm_sync_imgs = getenv( "STAGING_SHM_SYNC_TARGETS" );
 
 #if defined(__linux__) && (defined(__i386__) || defined(__x86_64__))
     shm_sync_enabled = shm_val
@@ -879,7 +1010,36 @@ NTSTATUS ntdll_object_db_init(void)
     shm_sync_enabled = 0;
 #endif
 
-    sync_impl_init( ntdll_object_move, ntdll_object_destroy, &shmglobal->last_server_cpu);
+    assert_sizes();
+
+    /* If using STAGING_SHM_SYNC_TARGETS, disable if not one of the listed images.  */
+    if (shm_sync_enabled && shm_sync_imgs)
+    {
+	char *imgs = RtlAllocateHeap(GetProcessHeap(), 0, strlen(shm_sync_imgs) + 1);
+	char *img = RtlAllocateHeap(GetProcessHeap(), 0, strlen(shm_sync_imgs) + 1);
+	char *p;
+
+	if (!(imgs && img))
+	    return ERROR_OUTOFMEMORY;
+
+	strcpy (imgs, shm_sync_imgs);
+	strcpy (img, __wine_main_argv[1]);
+	if (strchr (img, '.'))
+	    *strchr (img, '.') = 0;
+
+	shm_sync_enabled = 0;
+	for (p = strtok(imgs, ","); p; p = strtok(NULL, ","))
+	{
+	    if (!strcmp (p, img))
+		shm_sync_enabled = 1;
+	}
+	fprintf(stderr, "\n\nHybrid Sync %sabled for process %s\n", shm_sync_enabled ? "EN" : "DIS", img);
+	RtlFreeHeap(GetProcessHeap(), 0, img);
+	RtlFreeHeap(GetProcessHeap(), 0, imgs);
+    }
+
+
+    sync_impl_init( ntdll_object_move, ntdll_object_destroy, ntdll_object_server_wake, &shmglobal->last_server_cpu);
     TRACE_(ntdllobj)("\n");
 
     /* init objects list if not already inited */
@@ -888,21 +1048,7 @@ NTSTATUS ntdll_object_db_init(void)
         list_init(&objects.list);
     rwlock_end(&objects.rwlock, &sigset);
 
-    /* init red-black handle-to-object tree if not already inited */
-    rwlock_begin_write(&handles.rwlock, &sigset);
-    if (!handles.tree.stack.entries)
-    {
-        /* passing handles.tree.functions instead of obj_handles_rb_ops to aid -findirect-inline
-         * (it might not matter) */
-        if (wine_rb_init(&handles.tree, handles.tree.functions) == -1)
-        {
-            ERR("Failed to initialize ntdll object handle rbtree.\n");
-            ret = ERROR_OUTOFMEMORY;
-        }
-        else
-            atexit(ntdll_objects_cleanup);
-    }
-    rwlock_end(&handles.rwlock, &sigset);
+    atexit(ntdll_objects_cleanup);
 
     return ret;
 }

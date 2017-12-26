@@ -630,22 +630,29 @@ unsigned int server_select( const select_op_t *select_op, data_size_t size, UINT
     apc_call_t call;
     apc_result_t result;
     timeout_t abs_timeout = timeout ? timeout->QuadPart : TIMEOUT_INFINITE;
+    size_t nb_handles = (size - offsetof( select_op_t, wait.handles ))
+                        / sizeof(select_op->wait.handles[0]);
 
     memset( &result, 0, sizeof(result) );
+
+    /* Attempt a multi/single wait any or a single wait locally.  */
 
     /* TODO: need to make sure that handles array doesn't contain any duplicates or it could mess up hybrid sync */
 #define ENABLE_HYBRID_SYNC
 #ifdef ENABLE_HYBRID_SYNC
+
     TRACE_(ntdllsync)("select_op = %p, size = %u, flags = 0x%x, timeout = %p (%lld)\n",
                        select_op, size, flags, timeout, (timeout ? (long long)timeout->QuadPart : 0LL));
 
     /* bWaitAll = FALSE */
-    if (select_op && (select_op->op == SELECT_WAIT || select_op->op == SELECT_WAIT_ALL))
+#if 0
+    if (select_op && (select_op->op == SELECT_WAIT
+                      || (select_op->op == SELECT_WAIT_ALL && nb_handles == 1)))
+#endif
+    if (select_op && nb_handles == 1 && (select_op->op == SELECT_WAIT || select_op->op == SELECT_WAIT_ALL))
     {
         struct ntdll_object *objs[MAXIMUM_WAIT_OBJECTS];
         size_t nb_locally_lockable_objs = 0;
-        size_t nb_handles = (size - offsetof( select_op_t, wait.handles ))
-                            / sizeof(select_op->wait.handles[0]);
         ssize_t i;
         NTSTATUS res;
         ssize_t wait_object = 0;
@@ -660,7 +667,7 @@ unsigned int server_select( const select_op_t *select_op, data_size_t size, UINT
             if ((objs[i] = ntdll_handle_find( h )))
             {
                 /* omit server-private objects */
-                if (hybrid_object_is_server_private( &objs[i]->any.ho ))
+                if (objs[i]->private)
                 {
                     res = ntdll_object_release( objs[i] );
                     if (res)
@@ -685,9 +692,12 @@ unsigned int server_select( const select_op_t *select_op, data_size_t size, UINT
             goto local_done;
         }
 
-        /* send wait multiple (bWaitAll = TRUE) and non-local objects to server. */
-        if (select_op->op == SELECT_WAIT_ALL || !nb_locally_lockable_objs)
+        /* If no locally loackable objects use server.  */
+        if (!nb_locally_lockable_objs)
             goto local_done;
+
+        /* If we did this right then this can't happen.  */
+        assert (select_op->op != SELECT_WAIT_ALL);
 
         /* WaitForMultipleObjectsEx with bWaitAll = FALSE must go in order */
         for (i = 0; i < nb_handles; ++i)
@@ -1236,7 +1246,7 @@ static NTSTATUS server_get_shared_memory( HANDLE thread, void **ptr_ptr )
  *     info    [IO] See below
  *
  * The input should populate info->shm_id with the unique id for the shared memory (provided by the
- * server) if known. If info->shm_id is != -1 then the offset should also be supplied. The output
+ * server) if known. If info->shm_id is != 0 then the offset should also be supplied. The output
  * will populate shm_id and offset if not known and will always populate info->ptr if the call
  * succeeds.
  *
@@ -1246,7 +1256,6 @@ static NTSTATUS server_get_shared_memory( HANDLE thread, void **ptr_ptr )
  */
 NTSTATUS server_get_object_shared_memory( HANDLE obj, struct shm_object_info *info )
 {
-    const unsigned int vprot = VPROT_READ | VPROT_WRITE | VPROT_COMMITTED;
     NTSTATUS ret;
 
     if (!have_shm_sync())
@@ -1256,7 +1265,7 @@ NTSTATUS server_get_object_shared_memory( HANDLE obj, struct shm_object_info *in
     {
         /* first see if this shm_id is already known and mapped */
         info->fd = -1;
-        ret = virtual_get_shared_memory( NULL, info, vprot);
+        ret = virtual_get_shared_memory( NULL, info );
 
         if (!ret)
             goto done;
@@ -1271,7 +1280,7 @@ NTSTATUS server_get_object_shared_memory( HANDLE obj, struct shm_object_info *in
     if (ret)
         return ret;
 
-    ret = virtual_get_shared_memory( NULL, info, vprot );
+    ret = virtual_get_shared_memory( NULL, info );
     close( info->fd );
 
     if (ret)
@@ -1858,7 +1867,7 @@ size_t server_init_thread( void *entry_point )
     }
 }
 
-NTSTATUS server_notify_signaled( HANDLE obj )
+NTSTATUS server_wake( HANDLE obj )
 {
     NTSTATUS ret;
 

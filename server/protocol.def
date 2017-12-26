@@ -1162,7 +1162,7 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     VARARG(objattr,object_attributes); /* object attributes */
 @REPLY
     obj_handle_t handle;        /* handle to the semaphore */
-    unsigned int flags;         /* struct hybrid_sync_object::flags_refcount & 1 */
+    unsigned int private;       /* true if object is server-private */
     client_ptr_t shm_id;        /* unique id for the shared memory block */
     unsigned int offset;        /* offset from start of shared memory to the object */
 @END
@@ -1194,7 +1194,7 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     VARARG(name,unicode_str);   /* object name */
 @REPLY
     obj_handle_t handle;        /* handle to the semaphore */
-    unsigned int flags;         /* struct hybrid_sync_object::flags_refcount & 1 */
+    unsigned int private;       /* true if object is server-private */
     client_ptr_t shm_id;        /* unique id for the shared memory block */
     unsigned int offset;        /* offset from start of shared memory to the object */
     unsigned int max;           /* max value */
@@ -1284,6 +1284,7 @@ enum server_fd_type
 @REQ(get_shared_memory)
     thread_id_t  tid;           /* thread id or 0 */
     obj_handle_t handle;        /* handle to object or NULL */
+    int          release_old;
 @REPLY
     client_ptr_t shm_id;        /* id for the current shared memory block object resides in */
     unsigned int offset;        /* offset from start of shared memory to the object */

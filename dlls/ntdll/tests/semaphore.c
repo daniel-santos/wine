@@ -18,15 +18,33 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <unistd.h>
 #include "ntdll_test.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <assert.h>
 
+#include "wine/sync.h"
+
+struct ntdll_object {
+    struct ntdll_object_type   *type;       /* type */
+    union hybrid_object_any     any __attribute__((aligned(16)));
+    int                         private:1;
+    HANDLE                      h;          /* handle to the object (may be more than one handle to the same server-side obj) */
+};
+
+static NTSTATUS __must_check (*pntdll_object_release)(struct ntdll_object *obj);
+static const char           *(*pntdll_object_dump)(const struct ntdll_object *obj);
+static struct ntdll_object  *(*pntdll_handle_find)(const HANDLE h);
+static void                  (*pvirtual_shared_memory_dumpeth)(void **p, HANDLE heap);
+static void                  (*pntdll_object_whose_use)(void *ptr);
+
+
 static char         base[MAX_PATH];
 static char         selfname[MAX_PATH];
 static const char  *exename;
+static int          breakpoint_workaround = 0;
 
 static struct migration_test_params
 {
@@ -267,23 +285,34 @@ static void test_sem(void)
 #undef NUM_SEMS
 #if 1
 #define MAX_NUM_SEMS             128    /* maximum number of semaphores to use */
-#define NUM_THREAD_PROCESS_PAIRS 24 
+#define NUM_THREAD_PROCESS_PAIRS 64
 #define PAIR_MAX_SEMS            32     /* how many sems each thread in main process will use */
-#else
-#define MAX_NUM_SEMS             4    /* maximum number of semaphores to use */
+#elif 1
+#define MAX_NUM_SEMS             64
+#define NUM_THREAD_PROCESS_PAIRS 32
+#define PAIR_MAX_SEMS            16
+#elif 0
+#define MAX_NUM_SEMS             32
+#define NUM_THREAD_PROCESS_PAIRS 16
+#define PAIR_MAX_SEMS            8
+#elif 1
+#define MAX_NUM_SEMS             4
 #define NUM_THREAD_PROCESS_PAIRS 1
-#define PAIR_MAX_SEMS            4     /* how many sems each thread in main process will use */
+#define PAIR_MAX_SEMS            4
 #endif
 
-#define STRESS_WAIT_TIME        8000
+#define STRESS_WAIT_TIME        (2 * 60 * 60 * 1000)
 
 enum migration_test_state
 {
     STATE_INIT,
     STATE_WAITING,
     STATE_RELEASED,
+    STATE_TEST_FINISHED,
     STATE_DONE,
-    STATE_ABORT
+    STATE_ABORT,
+
+    STATE_COUNT
 };
 
 struct migration_test_data;
@@ -408,26 +437,51 @@ static void dump_migration_test(struct migration_test *test)
     trace(buffer);
 }
 
+static inline int interlocked_xchg_add( int *dest, int incr )
+{
+    int ret;
+    __asm__ __volatile__( "lock; xaddl %0,(%1)"
+                          : "=r" (ret) : "r" (dest), "0" (incr) : "memory" );
+    return ret;
+}
 
-/* a stupid wait and cmp/xchng function */
+/* A stupid function that waits for a shared memory value to equals expected_value
+ * and then changes to new_value with a compare and swap.  */
 static int wait_for_value_and_set(volatile int *addr, int expected_value, int new_value, DWORD duration)
 {
     ULONGLONG end = GetTickCount64() + (ULONGLONG)duration;
-    int cur_value;
+    int cur_value = 0;
+    asm volatile( "lock; xaddl %0,(%1)": "=r" (cur_value) : "r" (addr), "0"(0) : "memory" );
 
-    while ((cur_value = *addr) != expected_value && (LONGLONG)(end - GetTickCount64()) > 0ll)
+    while ((LONGLONG)(end - GetTickCount64()) > 0ll)
     {
-        if (cur_value == STATE_DONE || cur_value == STATE_ABORT)
+        if (cur_value == expected_value)
+        {
+            int old = cur_value;
+            cur_value = InterlockedCompareExchange(addr, new_value, expected_value);
+            if (old == cur_value)
+                return cur_value;
+        } else if (cur_value == STATE_DONE || cur_value == STATE_ABORT)
             return cur_value;
-        Sleep(4);
+#if 0
+        {
+           struct timespec t;
+            t.tv_sec = 0;
+            t.tv_nsec = 0;
+            nanosleep (
+        }
+#endif
+        usleep (4);
+        //Sleep(4);
+        asm volatile ("" ::: "memory");
+        cur_value = *addr;
     }
 
-    if (cur_value != expected_value)
-        return cur_value;
-    else
-        return InterlockedCompareExchange(addr, new_value, expected_value);
+    fprintf(stderr, "TIMEOUT\n");
+    return (*addr = STATE_ABORT);
 }
 
+/* Initialize thread-process pair.  */
 static void init_pair_data(struct thread_process_pair *pair, unsigned *seed, unsigned id,
                            void *shm, unsigned *sem_users)
 {
@@ -468,7 +522,9 @@ static void get_next_test(struct thread_process_pair *pair, struct migration_tes
 {
     int i, j, k;
 
-    test->type = rand_r(&pair->seed) % SEM_TEST_MULTIPLE_ANY; // SEM_TEST_COUNT;
+    //test->type = rand_r(&pair->seed) %  SEM_TEST_COUNT;
+    // Test singles first
+    test->type = SEM_TEST_SINGLE;
 
     if (test->type == SEM_TEST_SINGLE)
         test->nsems = 1;
@@ -501,6 +557,9 @@ continue_outer:
     }
 }
 
+/* Setup shared memory region used to communicate between a pair thread-process
+ * pair.  This is used so that the test its self doesn't break when we break
+ * IPC objects in ntdll.  */
 static void *get_shared_memory(HANDLE *h, BOOL create, BOOL *not_found)
 {
     size_t size = 8192 + sizeof(int) * (NUM_THREAD_PROCESS_PAIRS + 1);
@@ -557,6 +616,13 @@ static int test_migrate_spawn_process(struct thread_process_pair *pair, unsigned
     return !ret;        /* windows to rest-of-the-world return value */
 }
 
+
+
+/******************************************************************************
+ *              Migration Test Process
+ ******************************************************************************/
+
+/* Main function for auxilary mingration test process.  */
 static void test_migrate_process(int argc, const char *argv[])
 {
     struct thread_process_pair pair;
@@ -572,6 +638,12 @@ static void test_migrate_process(int argc, const char *argv[])
     int                        i;
     int                        state;
     BOOL                       was_not_found = 0;
+
+    if (0 && breakpoint_workaround)
+        Sleep (10 * 1000);
+
+    asm (".globl test_migrate_process_breakpoint\n"
+         "test_migrate_process_breakpoint:\n" :::);
 
     memset(&pair, 0, sizeof(pair));
     memset(&test, 0, sizeof(test));
@@ -713,6 +785,11 @@ static inline int thread_keep_going(struct migration_test_data *data)
     return !(data->abort || data->end);
 }
 
+
+/******************************************************************************
+ *              Migration Test Thread
+ ******************************************************************************/
+
 /* thread function for migration tests */
 static DWORD WINAPI test_migrate_thread( LPVOID lpParam )
 {
@@ -723,6 +800,11 @@ static DWORD WINAPI test_migrate_thread( LPVOID lpParam )
     int i = 0;
 
     memset(&test, 0, sizeof(test));
+    if (breakpoint_workaround)
+        Sleep (8 * 1000);
+
+    asm (".globl test_migrate_thread_breakpoint\n"
+         "test_migrate_thread_breakpoint:\n" :::);
 
     /* tell main thread that we're ready to start */
     do_test_ae(ret, ret, "%d", err == 0xdeadbeef,
@@ -733,7 +815,7 @@ static DWORD WINAPI test_migrate_thread( LPVOID lpParam )
     wait_for_value_and_set(pair->state, STATE_INIT, STATE_WAITING, STRESS_WAIT_TIME);
     /* wait for main thread to signal test start */
     do_test_ae(ret, ret == WAIT_OBJECT_0, "%d", err == 0xdeadbeef,
-               WaitForSingleObject, pair->sem_thread_repeat, 10000);
+               WaitForSingleObject, pair->sem_thread_repeat, STRESS_WAIT_TIME);
 
     /* TODO: audit this later for memory barrier to make sure that we can't run forever */
     while(thread_keep_going(data))
@@ -781,18 +863,29 @@ static DWORD WINAPI test_migrate_thread( LPVOID lpParam )
             goto abort;
         }
 
+        {
+            state = wait_for_value_and_set(pair->state, STATE_RELEASED, STATE_TEST_FINISHED, STRESS_WAIT_TIME);
+            if (state == STATE_ABORT)
+                goto abort;
+            ok (state == STATE_RELEASED, "state = %d, expected STATE_RELEASED\n", state);
+            if (state != STATE_RELEASED)
+                goto abort;
+        }
+
         /* wait for signal to start next test */
         do_test_ae(ret, ret == WAIT_OBJECT_0, "%d", err == 0xdeadbeef,
                    WaitForSingleObject, pair->sem_thread_repeat, STRESS_WAIT_TIME);
         if (ret != WAIT_OBJECT_0)
             goto abort;
 
-        state = wait_for_value_and_set(pair->state, STATE_RELEASED, STATE_WAITING, STRESS_WAIT_TIME);
-        if (state == STATE_ABORT)
-            goto abort;
-        ok (state == STATE_RELEASED, "state = %d, expected STATE_RELEASED\n", state);
-        if (state != STATE_RELEASED)
-            goto abort;
+        {
+            state = wait_for_value_and_set(pair->state, STATE_TEST_FINISHED, STATE_WAITING, STRESS_WAIT_TIME);
+            if (state == STATE_ABORT)
+                goto abort;
+            ok (state == STATE_TEST_FINISHED, "state = %d, expected STATE_TEST_FINISHED\n", state);
+            if (state != STATE_TEST_FINISHED)
+                goto abort;
+        }
         ++i;
     }
     wait_for_value_and_set(pair->state, STATE_RELEASED, STATE_DONE, STRESS_WAIT_TIME);
@@ -802,6 +895,8 @@ abort:
     data->abort = 1;
     return -1;
 }
+
+
 
 static int keep_running(const struct migration_test_data *data, unsigned count)
 {
@@ -814,6 +909,98 @@ static int keep_running(const struct migration_test_data *data, unsigned count)
          : data->stop_time - GetTickCount64() > 0;
 }
 
+
+
+
+
+
+
+
+
+
+
+
+/******************************************************************************
+ *              Migrate Main Thread
+ ******************************************************************************/
+
+#ifdef __x86_64__
+static inline unsigned char interlocked_cmpxchg128( __int64 *dest, __int64 xchg_high,
+                                                    __int64 xchg_low, __int64 *compare )
+{
+    unsigned char ret;
+    __asm__ __volatile__( "lock cmpxchg16b %0; setz %b2"
+                          : "=m" (dest[0]), "=m" (dest[1]), "=r" (ret),
+                            "=a" (compare[0]), "=d" (compare[1])
+                          : "m" (dest[0]), "m" (dest[1]), "3" (compare[0]), "4" (compare[1]),
+                            "c" (xchg_high), "b" (xchg_low) );
+    return ret;
+}
+#endif
+
+static char debug_read_sem( struct ntdll_object *o)
+{
+    int repeat;
+    unsigned long flags;
+
+    union hso_atomic cur, old;
+    cur = */*(volatile union hso_atomic*)*/&o->any.ho.atomic;
+
+    do {
+        old = cur;
+        if (sizeof(cur) == 8)
+        {
+            cur.int64[0] = InterlockedCompareExchange64( o->any.ho.atomic.int64, cur.int64[0], cur.int64[0] );
+            repeat = cur.int64[0] != old.int64[0];
+        } else if (sizeof(cur) == 16)
+            repeat = !interlocked_cmpxchg128( o->any.ho.atomic.int64, cur.int64[1], cur.int64[0],
+                                              cur.int64);
+    } while (repeat);
+    if (o->private)
+        return 'P';
+    else
+    {
+        flags = hso_atomic_get_flags( &cur );
+        if (!(flags & HYBRID_SYNC_ACCESSIBLE))
+            return '!';
+        else if (flags & HYBRID_SYNC_LOCKED)
+            return 'L';
+        else if (flags & HYBRID_SYNC_BAD)
+            return 'B';
+        else
+        {
+            union shm_sync_value value;
+            value.int64 = *(volatile __int64*)&cur.value->int64;
+            value.int64 = InterlockedCompareExchange64( &cur.value->int64, value.int64, value.int64 );
+
+            if (value.flags_hash & SHM_SYNC_VALUE_CORRUPTED)
+                return 'B';
+            else if (value.flags_hash & SHM_SYNC_VALUE_LOCKED)
+                return 'T';
+            else if (value.flags_hash & SHM_SYNC_VALUE_MOVED)
+                return 'M';
+            else if (value.data < 10)
+                return '0' + value.data;
+            else
+                return '+';
+        }
+    }
+};
+
+static void init_header (char *header, size_t size)
+{
+    int i;
+    for (i = 0; i < size - 1; ++i)
+        if (!(i % 10))
+            header[i] = '0' + (i / 10) % 10;
+        else if (!(i % 5))
+            header[i] = ':';
+        else
+            header[i] = '.';
+    header[i] = 0;
+}
+
+/* Perform migration stress test.  */
 void test_migrate(void)
 {
     char                buffer[MAX_PATH];
@@ -823,6 +1010,12 @@ void test_migrate(void)
     unsigned            count;
     struct migration_test_data *data;
     unsigned            post_init_rand[NUM_THREAD_PROCESS_PAIRS];
+    struct ntdll_object *objs[MAX_NUM_SEMS];
+    char debug_pairs_header[NUM_THREAD_PROCESS_PAIRS + 1];
+    char debug_sem_header[MAX_NUM_SEMS + 1];
+
+    init_header( debug_pairs_header, sizeof(debug_pairs_header));
+    init_header( debug_sem_header, sizeof(debug_sem_header));
 
     if (params.seed == UINT_MAX)
         params.seed = GetTickCount();
@@ -845,7 +1038,7 @@ void test_migrate(void)
     printf("%s running with seed %u\n", __func__, params.seed);
     seed_next = params.seed;
 
-    /* init test data */
+    /* Init test data.  */
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
     {
         init_pair_data(&data->pairs[i], &seed_next, i, data->shm, data->sem_users);
@@ -856,21 +1049,27 @@ void test_migrate(void)
 //    do_test_ae(data->sem_main, !!data->sem_main, "%p", !err,
 //               CreateSemaphoreA, NULL, 0, NUM_THREAD_PROCESS_PAIRS, "test_migrate_sem_main");
 
-    /* create semaphores used for tests */
+    /* Create semaphores used for tests.  */
     for (i = 0; i < MAX_NUM_SEMS; ++i)
     {
-        /* if initialization didn't assign any users then skip it */
+        /* If initialization didn't assign any users then skip it.  */
         if (!data->sem_users[i])
+        {
+            objs[i] = NULL;
             continue;
+        }
 
         snprintf(buffer, sizeof(buffer), "test_migrate_sem %u", i);
         trace("creating sem with name \"%s\", max = %u\n", buffer, data->sem_users[i]);
         do_test_ae(data->sems[i], !!data->sems[i], "%p", !err,
                    CreateSemaphoreA, NULL, 0, data->sem_users[i], buffer);
+
+        objs[i] = pntdll_handle_find(data->sems[i]);
+        if (objs[i])
+            assert( pntdll_object_release(objs[i]) == STATUS_SUCCESS );
     }
 
-
-    /* create thread_ready semaphores & init pair->sems[] arrays */
+    /* Create thread_ready semaphores & init pair->sems[] arrays.  */
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
     {
         HANDLE h;
@@ -895,6 +1094,7 @@ void test_migrate(void)
         if (0)
             dump_thread_process_pair(pair);
     }
+
 #if 0
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
     {
@@ -953,8 +1153,8 @@ die:
             CloseHandle(data->sems[i]);
 
     exit(0);
-
 #endif
+
 
 for (j = 0; j < 100; ++j) {
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
@@ -963,12 +1163,12 @@ for (j = 0; j < 100; ++j) {
 
     do_test_ae(ret, ret == WAIT_OBJECT_0, "%08x", err == 0xdeadbeef,
                WaitForMultipleObjects, NUM_THREAD_PROCESS_PAIRS, &data->sems_thread_ready[0],
-                                       TRUE, 10000 );
+                                       TRUE, STRESS_WAIT_TIME );
 }
 
 
 
-    /* create our test threads */
+    /* Create our test threads.  */
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
     {
         struct thread_process_pair *pair = &data->pairs[i];
@@ -980,19 +1180,26 @@ for (j = 0; j < 100; ++j) {
         data->threads[i] = pair->thread_handle;
     }
 
-    /* wait for threads to get started and signal that they're ready so we have the greatest chance
-     * for contention */
+    if (breakpoint_workaround)
+        Sleep (8 * 1000);
+
+    asm (".globl test_migrate_main_breakpoint\n"
+         "test_migrate_main_breakpoint:\n" :::);
+
+    /* Wait for threads to get started and signal that they're ready so we have the greatest chance
+     * for contention.  */
     do_test_ae(ret, ret == WAIT_OBJECT_0, "%08x", err == 0xdeadbeef,
                WaitForMultipleObjects, NUM_THREAD_PROCESS_PAIRS, &data->sems_thread_ready[0],
-                                       TRUE, 10000 );
+                                       TRUE, STRESS_WAIT_TIME );
     if (ret != WAIT_OBJECT_0)
         goto abort;
 
 #if 0
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
         do_test_ae(ret, ret == WAIT_OBJECT_0, "%d", err == 0xdeadbeef,
-                   WaitForSingleObject, data->pairs[i].sem_thread_ready, 10000 );
+                   WaitForSingleObject, data->pairs[i].sem_thread_ready, STRESS_WAIT_TIME );
 #endif
+    /* Signal the threads to start.  */
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
         do_test_ae(ret, ret, "%d", err == 0xdeadbeef,
                    ReleaseSemaphore, data->pairs[i].sem_thread_repeat, 1, NULL );
@@ -1003,20 +1210,83 @@ for (j = 0; j < 100; ++j) {
     else
         data->num_iterations = params.iterations;
 
-    /* now spawn processes that interact with each thread */
+    /* Now we spawn processes that interact with each thread.  */
     for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
         if (test_migrate_spawn_process(&data->pairs[i], post_init_rand[i]))
             goto abort;
 
+
+
+
+fprintf(stderr, "\nSTART\n");
+//pvirtual_shared_memory_dumpeth(NULL, NULL);
+
+
+
+
+    /* Repeat tests either params.iterations times or until params.duration has elapsed.  */
     for (count = 0; !data->end;)
     {
+        const long loop_time = 1 * 4000;
+        const long wait_loops = STRESS_WAIT_TIME / loop_time;
+        int wait_count;
 //        trace("iteration %u\n", count);
         fprintf(stderr, "%u", count);
-        do_test_ae(ret, ret == WAIT_OBJECT_0, "%08x", err == 0xdeadbeef,
-                   WaitForMultipleObjects, NUM_THREAD_PROCESS_PAIRS, data->sems_thread_ready,
-                                           TRUE, 10000 );
+
+        for (wait_count = 0; wait_count < wait_loops; ++wait_count)
+        {
+            char debug_sems_buf[MAX_NUM_SEMS + 1];
+            char debug_pairs_buf[NUM_THREAD_PROCESS_PAIRS + 1];
+            //dbgbuf[MAX_NUM_SEMS] = 0;
+
+            /* Wait for this test set to complete.  */
+            do_test_ae(ret, (ret == WAIT_OBJECT_0 || ret == WAIT_TIMEOUT), "%08x", err == 0xdeadbeef,
+                       WaitForMultipleObjects, NUM_THREAD_PROCESS_PAIRS, data->sems_thread_ready,
+                                               TRUE, loop_time );
+
+#if 1 /* debug spew */
+//pvirtual_shared_memory_dumpeth(NULL, NULL);
+
+        if (ret == WAIT_TIMEOUT) {
+            for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
+            {
+                enum migration_test_state state = ((int*)data->shm)[i];
+                assert (state < STATE_COUNT);
+                debug_pairs_buf[i] = "IWRFDA"[state];
+            }
+            debug_pairs_buf[i] = 0;
+
+            for (i = 0; i < MAX_NUM_SEMS; ++i)
+                debug_sems_buf[i] = objs[i] ? debug_read_sem( objs[i] ) : ' ';
+            debug_sems_buf[i] = 0;
+
+            fprintf(stderr, "\n       %s\nPairs: %s\n       %s\nSems:  %s\n",
+                    debug_pairs_header, debug_pairs_buf,
+                    debug_sem_header, debug_sems_buf);
+
+Sleep(100);
+pvirtual_shared_memory_dumpeth(NULL, NULL);
+        }
+
+#endif
+
+            if (ret == WAIT_OBJECT_0)
+                break;
+        }
         if (ret != WAIT_OBJECT_0)
             goto abort;
+
+
+
+
+
+
+
+
+
+
+
+
 
         if (!keep_running(data, ++count))
         {
@@ -1024,6 +1294,7 @@ for (j = 0; j < 100; ++j) {
             asm volatile ("" : : : "memory");
         }
 
+        /* Signal threads to run again.  */
         for (i = 0; i < NUM_THREAD_PROCESS_PAIRS; ++i)
             do_test_ae(ret, ret, "%d", err == 0xdeadbeef,
                        ReleaseSemaphore, data->pairs[i].sem_thread_repeat, 1, NULL );
@@ -1034,9 +1305,10 @@ for (j = 0; j < 100; ++j) {
         }
     }
 
+    /* Wait for threads to terminate.  */
     do_test_ae(ret, ret == WAIT_OBJECT_0, "%08x", err == 0xdeadbeef,
                 WaitForMultipleObjects, NUM_THREAD_PROCESS_PAIRS, &data->threads[0],
-                                        TRUE, 10000 );
+                                        TRUE, STRESS_WAIT_TIME );
     trace("main process proceeding now...\n");
 
     for (i = 0; i < MAX_NUM_SEMS; ++i)
@@ -1074,6 +1346,20 @@ static BOOL init( const char *argv0 )
     return TRUE;
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static void show_usage(int argc, const char *argv[])
 {
     int i;
@@ -1094,6 +1380,19 @@ START_TEST(semaphore)
     const char **argv;
     int argc = winetest_get_mainargs( (char ***)&argv );
     unsigned i;
+    HMODULE hntdll = GetModuleHandleA("ntdll.dll");
+
+    if (!hntdll)
+    {
+        skip("not running on NT, skipping test\n");
+        return;
+    }
+
+    pntdll_object_release = (void *)GetProcAddress(hntdll, "ntdll_object_release");
+    pntdll_object_dump = (void *)GetProcAddress(hntdll, "ntdll_object_dump");
+    pntdll_handle_find = (void *)GetProcAddress(hntdll, "ntdll_handle_find");
+    pvirtual_shared_memory_dumpeth = (void *)GetProcAddress(hntdll, "virtual_shared_memory_dumpeth");
+    pntdll_object_whose_use = (void *)GetProcAddress(hntdll, "ntdll_object_whose_use");
 
     if (!init( argv[0] ))
     {
@@ -1137,12 +1436,16 @@ START_TEST(semaphore)
         else
             show_usage(argc, argv);
     }
+
+
+
+
     test_sem_simple_wait();
-if (0){
+if (1){
     test_sem_simple_create();
     test_limits();
     test_sem_simple_wait();
     test_sem();
-} else
+}
     test_migrate();
 }

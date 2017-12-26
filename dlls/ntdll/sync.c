@@ -223,20 +223,21 @@ NTSTATUS validate_open_object_attributes( const OBJECT_ATTRIBUTES *attr )
  *	Semaphores
  */
 
-/* common code for NtCreateSemaphore and NtOpenSemaphore */
-static NTSTATUS create_semaphore(HANDLE h, LONG initial, LONG max, NTSTATUS ret, struct shm_object_info *info, int is_create)
+/* Common code for NtCreateSemaphore and NtOpenSemaphore. */
+static NTSTATUS create_semaphore( HANDLE h, LONG initial, LONG max, NTSTATUS ret,
+                                  struct shm_object_info *info )
 {
     struct ntdll_object *obj;
     NTSTATUS result;
 
     if (ret && ret != STATUS_OBJECT_NAME_EXISTS)
         return ret;
-
-    /* if a private object then we won't create a client-side object */
-    if (info->flags & HYBRID_SYNC_SERVER_PRIVATE)
+#if 1
+    /* if a private object then we won't create a client-side object (for now) */
+    if (info->private)
         return ret;
-
-    result = ntdll_object_new(&obj, h, sizeof(struct ntdll_object), &semaphore_type, info);
+#endif
+    result = ntdll_object_new( &obj, h, sizeof(struct ntdll_object), &semaphore_type, info );
     if (result)
         return result;
 
@@ -274,7 +275,7 @@ NTSTATUS WINAPI NtCreateSemaphore( OUT PHANDLE SemaphoreHandle,
 
     SERVER_START_REQ( create_semaphore )
     {
-        struct shm_object_info info = shm_object_info_init( &info );
+        struct shm_object_info info = shm_object_info_init(  );
 
         req->access  = access;
         req->initial = InitialCount;
@@ -282,11 +283,11 @@ NTSTATUS WINAPI NtCreateSemaphore( OUT PHANDLE SemaphoreHandle,
         wine_server_add_data( req, objattr, len );
         ret = wine_server_call( req );
         *SemaphoreHandle = wine_server_ptr_handle( reply->handle );
-        info.flags       = reply->flags;
+        info.private     = reply->private;
         info.shm_id      = reply->shm_id;
         info.offset      = reply->offset;
 
-        ret = create_semaphore(*SemaphoreHandle, InitialCount, MaximumCount, ret, &info, TRUE);
+        ret = create_semaphore( *SemaphoreHandle, InitialCount, MaximumCount, ret, &info );
 if (0)
 {
     char buf[0x400];
@@ -315,7 +316,7 @@ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
     SERVER_START_REQ( open_semaphore )
     {
-        struct shm_object_info info = shm_object_info_init( &info );
+        struct shm_object_info info = shm_object_info_init( );
 
         req->access     = access;
         req->attributes = attr->Attributes;
@@ -324,11 +325,11 @@ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJEC
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret              = wine_server_call( req );
         *handle = wine_server_ptr_handle( reply->handle );
-        info.flags       = reply->flags;
+        info.private     = reply->private;
         info.shm_id      = reply->shm_id;
         info.offset      = reply->offset;
 
-        ret = create_semaphore(*SemaphoreHandle, 0, reply->max, ret, &info, FALSE);
+        ret = create_semaphore( *handle, 0, reply->max, ret, &info );
     }
     SERVER_END_REQ;
     return ret;
@@ -342,6 +343,7 @@ NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS cla
 {
     NTSTATUS ret;
     SEMAPHORE_BASIC_INFORMATION *out = info;
+    struct ntdll_object *obj;
 
     TRACE("(%p, %u, %p, %u, %p)\n", handle, class, info, len, ret_len);
 
@@ -353,7 +355,22 @@ NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS cla
 
     if (len != sizeof(SEMAPHORE_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
 
-    SERVER_START_REQ( query_semaphore )
+    if ((obj = ntdll_handle_find(handle)))
+    {
+        NTSTATUS result;
+
+        if (obj->type != &semaphore_type)
+            ret = STATUS_OBJECT_TYPE_MISMATCH;
+        else
+        {
+            out->CurrentCount = obj->any.ho.atomic.value->data;
+            out->MaximumCount = obj->any.sem.max;
+        }
+        result = ntdll_object_release(obj);
+        if (result && !ret)
+            ret = result;
+    }
+    else SERVER_START_REQ( query_semaphore )
     {
         req->handle = wine_server_obj_handle( handle );
         if (!(ret = wine_server_call( req )))
@@ -390,19 +407,13 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, PULONG previous 
             goto exit;
         }
 
-        if (hybrid_object_is_server_private( &any->ho ))
+        if ( obj->private )
         {
             result = ntdll_object_release(obj);
             goto do_server_call;
         }
 
-        ret = hybrid_semaphore_release( &any->sem, count, previous, TRUE );
-
-        if (ret == SHM_SYNC_VALUE_NOTIFY_SVR)
-        {
-            server_notify_signaled( handle );
-            ret = STATUS_SUCCESS;
-        }
+        ret = hybrid_semaphore_release( &any->sem, count, previous );
 
 exit:
         result = ntdll_object_release(obj);

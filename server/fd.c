@@ -2500,29 +2500,20 @@ DECL_HANDLER(get_shared_memory)
     if (req->handle)
     {
         struct hybrid_server_object *hso;
-        struct shm_object_info info = shm_object_info_init( &info );
+        struct shm_object_info info = shm_object_info_init( );
 
         if (!(hso = get_handle_hybrid_obj( current->process, req->handle, 0 )))
             return;
 
-        if (hybrid_object_is_server_private( &hso->any.ho ))
-        {
-            fprintf(stderr, "wineserver: ERROR %s: object is server private.", __func__);
-            set_error( STATUS_OBJECT_TYPE_MISMATCH );
-        }
-        else
-        {
-            /* it may have been shared before and become private */
-            if (!hybrid_object_is_server_private( &hso->any.ho ))
-            {
-                if (!process_group_get_new_release_old( hso, current->process, req->handle, &info ))
-                    send_client_fd( current->process, info.fd, 0 );
+        if (!process_group_get_new_release_old( hso, current->process, req->handle, &info,
+                                                req->release_old ))
+            send_client_fd( current->process, info.fd, 0 );
 
-                reply->shm_id = info.shm_id;
-                reply->size   = info.size;
-                reply->offset = info.offset;
-            }
-        }
+        reply->shm_id = info.shm_id;
+        reply->size   = info.size;
+        reply->offset = info.offset;
+
+        process_group_check_sanity( hso );
         release_object( hso );
     }
     else if (req->tid)
@@ -2547,7 +2538,7 @@ DECL_HANDLER(get_shared_memory)
         if (shmglobal_fd == -1)
             goto not_supported;
         send_client_fd( current->process, shmglobal_fd, 0 );
-        reply->size      = get_page_size();
+        reply->size = get_page_size();
     }
 
     return;

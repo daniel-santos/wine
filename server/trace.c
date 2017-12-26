@@ -1682,6 +1682,9 @@ static void dump_create_semaphore_request( const struct create_semaphore_request
 static void dump_create_semaphore_reply( const struct create_semaphore_reply *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", private=%08x", req->private );
+    dump_uint64( ", shm_id=", &req->shm_id );
+    fprintf( stderr, ", offset=%08x", req->offset );
 }
 
 static void dump_release_semaphore_request( const struct release_semaphore_request *req )
@@ -1717,6 +1720,10 @@ static void dump_open_semaphore_request( const struct open_semaphore_request *re
 static void dump_open_semaphore_reply( const struct open_semaphore_reply *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", private=%08x", req->private );
+    dump_uint64( ", shm_id=", &req->shm_id );
+    fprintf( stderr, ", offset=%08x", req->offset );
+    fprintf( stderr, ", max=%08x", req->max );
 }
 
 static void dump_create_file_request( const struct create_file_request *req )
@@ -1795,6 +1802,20 @@ static void dump_get_directory_cache_entry_reply( const struct get_directory_cac
 {
     fprintf( stderr, " entry=%d", req->entry );
     dump_varargs_ints( ", free=", cur_size );
+}
+
+static void dump_get_shared_memory_request( const struct get_shared_memory_request *req )
+{
+    fprintf( stderr, " tid=%04x", req->tid );
+    fprintf( stderr, ", handle=%04x", req->handle );
+    fprintf( stderr, ", release_old=%d", req->release_old );
+}
+
+static void dump_get_shared_memory_reply( const struct get_shared_memory_reply *req )
+{
+    dump_uint64( " shm_id=", &req->shm_id );
+    fprintf( stderr, ", offset=%08x", req->offset );
+    fprintf( stderr, ", size=%08x", req->size );
 }
 
 static void dump_flush_request( const struct flush_request *req )
@@ -4495,6 +4516,11 @@ static void dump_terminate_job_request( const struct terminate_job_request *req 
     fprintf( stderr, ", status=%d", req->status );
 }
 
+static void dump_notify_signaled_request( const struct notify_signaled_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
 static const dump_func req_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_new_process_request,
     (dump_func)dump_get_new_process_info_request,
@@ -4543,6 +4569,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_get_handle_unix_name_request,
     (dump_func)dump_get_handle_fd_request,
     (dump_func)dump_get_directory_cache_entry_request,
+    (dump_func)dump_get_shared_memory_request,
     (dump_func)dump_flush_request,
     (dump_func)dump_get_volume_info_request,
     (dump_func)dump_lock_file_request,
@@ -4784,6 +4811,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_set_job_limits_request,
     (dump_func)dump_set_job_completion_port_request,
     (dump_func)dump_terminate_job_request,
+    (dump_func)dump_notify_signaled_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] = {
@@ -4834,6 +4862,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_get_handle_unix_name_reply,
     (dump_func)dump_get_handle_fd_reply,
     (dump_func)dump_get_directory_cache_entry_reply,
+    (dump_func)dump_get_shared_memory_reply,
     (dump_func)dump_flush_reply,
     (dump_func)dump_get_volume_info_reply,
     (dump_func)dump_lock_file_reply,
@@ -5075,6 +5104,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] = {
     NULL,
     NULL,
     NULL,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] = {
@@ -5125,6 +5155,7 @@ static const char * const req_names[REQ_NB_REQUESTS] = {
     "get_handle_unix_name",
     "get_handle_fd",
     "get_directory_cache_entry",
+    "get_shared_memory",
     "flush",
     "get_volume_info",
     "lock_file",
@@ -5366,6 +5397,7 @@ static const char * const req_names[REQ_NB_REQUESTS] = {
     "set_job_limits",
     "set_job_completion_port",
     "terminate_job",
+    "notify_signaled",
 };
 
 static const struct
@@ -5394,6 +5426,7 @@ static const struct
     { "CONNECTION_DISCONNECTED",     STATUS_CONNECTION_DISCONNECTED },
     { "CONNECTION_REFUSED",          STATUS_CONNECTION_REFUSED },
     { "CONNECTION_RESET",            STATUS_CONNECTION_RESET },
+    { "DATATYPE_MISALIGNMENT",       STATUS_DATATYPE_MISALIGNMENT },
     { "DEBUGGER_INACTIVE",           STATUS_DEBUGGER_INACTIVE },
     { "DEVICE_BUSY",                 STATUS_DEVICE_BUSY },
     { "DIRECTORY_NOT_EMPTY",         STATUS_DIRECTORY_NOT_EMPTY },
@@ -5410,6 +5443,7 @@ static const struct
     { "ERROR_INVALID_WINDOW_HANDLE", 0xc0010000 | ERROR_INVALID_WINDOW_HANDLE },
     { "ERROR_NO_MORE_USER_HANDLES",  0xc0010000 | ERROR_NO_MORE_USER_HANDLES },
     { "ERROR_WINDOW_OF_OTHER_THREAD", 0xc0010000 | ERROR_WINDOW_OF_OTHER_THREAD },
+    { "FILE_CORRUPT_ERROR",          STATUS_FILE_CORRUPT_ERROR },
     { "FILE_DELETED",                STATUS_FILE_DELETED },
     { "FILE_IS_A_DIRECTORY",         STATUS_FILE_IS_A_DIRECTORY },
     { "FILE_LOCK_CONFLICT",          STATUS_FILE_LOCK_CONFLICT },
@@ -5437,6 +5471,7 @@ static const struct
     { "IO_TIMEOUT",                  STATUS_IO_TIMEOUT },
     { "KEY_DELETED",                 STATUS_KEY_DELETED },
     { "MAPPED_FILE_SIZE_ZERO",       STATUS_MAPPED_FILE_SIZE_ZERO },
+    { "MEMORY_NOT_ALLOCATED",        STATUS_MEMORY_NOT_ALLOCATED },
     { "MORE_PROCESSING_REQUIRED",    STATUS_MORE_PROCESSING_REQUIRED },
     { "MUTANT_NOT_OWNED",            STATUS_MUTANT_NOT_OWNED },
     { "NAME_TOO_LONG",               STATUS_NAME_TOO_LONG },
@@ -5488,6 +5523,7 @@ static const struct
     { "USER_APC",                    STATUS_USER_APC },
     { "USER_MAPPED_FILE",            STATUS_USER_MAPPED_FILE },
     { "VOLUME_DISMOUNTED",           STATUS_VOLUME_DISMOUNTED },
+    { "WAIT_63",                     STATUS_WAIT_63 },
     { "WAS_LOCKED",                  STATUS_WAS_LOCKED },
     { NULL, 0 }
 };

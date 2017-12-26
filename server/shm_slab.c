@@ -1,7 +1,7 @@
 /*
  * Shared memory slab allocator
  *
- * Copyright (C) 2015-2016 Daniel Santos
+ * Copyright (C) 2015-2017 Daniel Santos
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -31,29 +31,12 @@
 #include "thread.h"
 #include "file.h"
 
-/******************************************************************************
- *
- *                      Shared memory slab allocator
- *
- * struct shm_cache represents a cache of objects of a fixed size that are allocated from shared
- * memory slabs of type struct shm_slab. Normal principles of a slab allocation are followed except
- * that the struct shm_slab data is not stored within the slab its self, since the slab resides in
- * shared memory.
- *
- * Niblets
- * Internally, the library operates on data in "niblets", whos size is chosen at built time to be
- * the an optimal data size for the target machine to perform successive memory reads & writes to.
- * The purpose of this is only to optimize debugging features (object poisoning, padding & memory
- * verification) as a CPU typicaly reads & writes faster to aligned "words" of a particular size --
- * "niblets" in this library. All size & offset values are calculated in niblets internally (except
- * for shm_slab::struct_size, which is just the size of the object its self).
- *
- * In short, this allocator is hard-coded to manage objects of a fixed alignment and whos size will
- * always be rounded up to boundary of a niblet.
- *
- */
+#if 0
+/* HACK: For debugging only. */
+#include "object.h"
+#endif
 
-/* TODO: move to port.h, winnt.h or some such? */
+/* TODO: Move alignment macros to port.h, winnt.h or some such? */
 /* Make a promise to the compiler that pointer is aligned without generating code to check it (can
  * produce bad code if used incorrectly). see https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html
  */
@@ -68,29 +51,17 @@
 #define assert_aligned( ptr, align ) assert( ptr_is_aligned( ptr, align ) )
 #define assert_is_pow2( x ) assert( !((x) & ((x) - 1)) )
 
-#if SHM_SLAB_NIBLET_SIZE == 8
-# define SHM_SLAB_NIBLET_FORMAT  "%016lx"
-# define SHM_CACHE_FREE          0xaaaaaaaaaaaaaaaaul
-# define SHM_CACHE_UNINIT        0x5555555555555555ul
-# define SHM_CACHE_NO_MANS_LAND  0xfdfdfdfdfdfdfdfdul
-#elif SHM_SLAB_NIBLET_SIZE == 4
-# define SHM_SLAB_NIBLET_FORMAT  "%08lx"
-# define SHM_CACHE_FREE          0xaaaaaaaaul
-# define SHM_CACHE_UNINIT        0x55555555ul
-# define SHM_CACHE_NO_MANS_LAND  0xfdfdfdfdul
-#else
-# error long not 4 or 8 bytes
-#endif
-
 static __int64 next_slab_id = 1;
 
-/* hard-code alignment (in niblets) */
+static int shm_slab_verify_memory( struct shm_cache *cache, struct shm_slab *slab );
+
+/* Alignment is currently hard-code to a single niblet boundary.  */
 static inline size_t get_align( void )
 {
     return 1;
 }
 
-/* padding (if enabled) is always size of alignment */
+/* Padding (if enabled) is currently hard-coded to the size of the alignment boundary.  */
 static inline size_t get_padding( struct shm_cache *cache )
 {
     return cache->flags & SHM_CACHE_PAD ? get_align() : 0;
@@ -114,11 +85,11 @@ static inline void nibset( slab_niblet_t *ptr, slab_niblet_t value, size_t n )
         ptr[--n] = value;
 }
 
-/*
- *              struct shm_cache Functions
+/*************************************************************************************************
+ *                              struct shm_cache Functions
  */
 
-/* allocate a shm_slab object and summon shared memory */
+/* Allocate a shm_slab object and summon shared memory.  */
 static struct shm_slab *shm_slab_alloc( struct shm_cache *cache, size_t slab_size )
 {
     /* All calculations (excluding struct_size) are in niblets */
@@ -126,15 +97,15 @@ static struct shm_slab *shm_slab_alloc( struct shm_cache *cache, size_t slab_siz
     const size_t obj_store_size = get_store_size( cache );
     const size_t capacity       = slab_size / obj_store_size;
     const size_t map_size       = (capacity + SHM_SLAB_MAP_BITS - 1) / SHM_SLAB_MAP_BITS;
-    const size_t struct_size    = sizeof(struct shm_slab) + (map_size - 1) * SHM_SLAB_MAP_BYTES;
+    const size_t struct_size    = sizeof(struct shm_slab) + (map_size - 1) * sizeof(slab_map_t);
     struct shm_slab *slab;
     int fd;
     slab_niblet_t *ptr;
 
-    assert( !(slab_size % page_size) );
+    assert( !((slab_size * sizeof(slab_niblet_t)) % page_size) );
 
-    /* 64 bit unique id will wrap at ~18.4 quintillion (1.84+e31), at which point UB would
-     * become possible (although unlikely) */
+    /* 64 bit unique id will wrap at ~18.4 quintillion (1.84+e19), at which point UB would
+     * become possible (although unlikely).  */
     assert( next_slab_id != 0ll);
 
     if (!(slab = mem_alloc( struct_size )))
@@ -157,7 +128,7 @@ static struct shm_slab *shm_slab_alloc( struct shm_cache *cache, size_t slab_siz
     slab->id          = next_slab_id++;
     slab->slab_size   = slab_size;
     slab->struct_size = struct_size;
-    memset(slab->map, 0, map_size * SHM_SLAB_MAP_BYTES);
+    memset(slab->map, 0, map_size * sizeof(slab_map_t));
 
     /* take care of memory marking (in niblets) */
     if (cache->flags & (SHM_CACHE_POISON | SHM_CACHE_PAD))
@@ -174,28 +145,46 @@ static struct shm_slab *shm_slab_alloc( struct shm_cache *cache, size_t slab_siz
 
             /* mark object slots as unallocated */
             if (cache->flags & SHM_CACHE_POISON)
-                nibset(p + padding, SHM_CACHE_FREE, cache->obj_size);
+                nibset(p + padding, SHM_SLAB_FREE, cache->obj_size);
 
             /* mark padding as "no man's land". */
             for (i = 0; i < padding; ++i)
-                p[i] = p[i + end_pad_offset] = SHM_CACHE_NO_MANS_LAND;
+                p[i] = p[i + end_pad_offset] = SHM_SLAB_NO_MANS_LAND;
         }
 
         /* mark any unused portion as uninitiaized */
         if (cache->flags & SHM_CACHE_POISON)
-            nibset((void*)end, SHM_CACHE_UNINIT, slab_size - used);
+            nibset((void*)end, SHM_SLAB_UNINIT, slab_size - used);
     }
 
     return slab;
 }
 
 /* free a shm_slab object and it's associated shared memory */
-static void shm_slab_free( struct shm_slab *slab )
+static void shm_slab_free( struct shm_cache *cache, struct shm_slab *slab)
 {
+#if 0 /* HACK: for debugging... */
+    struct list *i;
+    LIST_FOR_EACH( i, &object_list )
+    {
+        struct object *o = LIST_ENTRY( i, struct object, obj_list );
+
+        if (o->ops->trywait_begin_trans)
+        {
+            struct hybrid_sync_object *hso = &((struct hybrid_server_object *)o)->any.ho;
+            slab_niblet_t *n = (slab_niblet_t*)hso->atomic.value;
+            assert (n < slab->ptr || n >= slab->ptr + slab->slab_size);
+        }
+    }
+#endif
+
     assert( !slab->count );
-    nibset( slab->ptr, SHM_CACHE_FREE, slab->slab_size );
+    if (cache->flags & SHM_CACHE_VERIFY_MEM)
+        shm_slab_verify_memory( cache, slab );
+    list_remove( &slab->entry );
+    nibset( slab->ptr, SHM_SLAB_FREE, slab->slab_size );
     release_shared_memory( slab->fd, slab->ptr, slab->slab_size * sizeof(slab_niblet_t) );
-    memset( slab, SHM_CACHE_FREE & 0xff, slab->struct_size );
+    memset( slab, SHM_SLAB_FREE & 0xff, slab->struct_size );
     free( slab );
 }
 
@@ -217,7 +206,7 @@ static int shm_slab_find_free(struct shm_cache *cache, struct shm_slab *slab, un
             int index = (p - slab->map) * SHM_SLAB_MAP_BITS + ctol(*p);
 
             /* there will usually be some unused bits at the end of the map */
-            if (index < (int)cache->capacity)
+            if (index < (int)slab->capacity)
                 return index;
         }
 
@@ -248,7 +237,8 @@ static inline int verify_niblet( const slab_niblet_t *addr, const slab_niblet_t 
     return 0;
 }
 
-/* verifies the object and pointer */
+/* Verifies the object and pointer.  */
+__attribute__((optimize(2)))
 static int verify_object_memory( struct shm_cache *cache, struct shm_slab *slab,
                                  const slab_niblet_t *ptr, int is_free )
 {
@@ -261,21 +251,41 @@ static int verify_object_memory( struct shm_cache *cache, struct shm_slab *slab,
         /* verify object was is memset correctly */
         if (is_free)
             for (i = 0; i < obj_size; ++i)
-                if (verify_niblet( &ptr[i], SHM_CACHE_FREE ))
+                if (verify_niblet( &ptr[i], SHM_SLAB_FREE ))
                     return 1;
 
         /* verify no-man's land is untouched */
         for (i = 0; i < padding; ++i)
         {
-            if (verify_niblet( &ptr[i - padding ], SHM_CACHE_NO_MANS_LAND ))
+            if (verify_niblet( &ptr[i - padding], SHM_SLAB_NO_MANS_LAND ))
                 return 1;
 
-            if (verify_niblet( &ptr[i + obj_size], SHM_CACHE_NO_MANS_LAND ))
+            if (verify_niblet( &ptr[i + padding], SHM_SLAB_NO_MANS_LAND ))
                 return 1;
         }
     }
 
     return 0;
+}
+
+/* Verify memory for a single slab.  */
+static __attribute__((optimize(2), flatten)) int
+shm_slab_verify_memory( struct shm_cache *cache, struct shm_slab *slab )
+{
+    const size_t padding        = get_padding( cache );
+    const size_t obj_store_size = get_store_size( cache );
+    size_t i;
+    int ret = 0;
+
+    /* Verify memory for each object slot.  */
+    for (i = 0; i < slab->capacity; ++i)
+    {
+        slab_map_t *entry, mask;
+        shm_slab_calc_map( slab, i, &entry, &mask );
+        ret |= verify_object_memory( cache, slab, &slab->ptr[padding + i * obj_store_size],
+                                     !(*entry & mask) );
+    }
+    return ret;
 }
 
 static inline int is_pointer_valid( struct shm_cache *cache, struct shm_slab *slab,
@@ -301,7 +311,7 @@ static slab_niblet_t *shm_slab_obj_do_alloc( struct shm_cache *cache, struct shm
                                              unsigned index, struct shm_object_info *info )
 {
     const size_t padding  = get_padding( cache );
-    const size_t offset   = get_store_size( cache ) * index + padding;
+    const size_t offset   = padding + get_store_size( cache ) * index;
     slab_niblet_t *ptr    = slab->ptr + offset;
     slab_map_t *entry, mask;
     shm_slab_calc_map( slab, index, &entry, &mask );
@@ -313,24 +323,23 @@ static slab_niblet_t *shm_slab_obj_do_alloc( struct shm_cache *cache, struct shm
         return NULL;
 
     if (cache->flags & SHM_CACHE_POISON)
-        nibset( ptr, SHM_CACHE_UNINIT, cache->obj_size );
+        nibset( ptr, SHM_SLAB_UNINIT, cache->obj_size );
 
     ++slab->count;
     *entry |= mask;
 
     /* While we have most of the data sitting around in registers, see if we can find the next free
-     * object and if not then at least record a hint. */
+     * object in this map entry and if not then at least record a hint. */
     index &= ~(SHM_SLAB_MAP_BITS - 1);
     if (*entry != ~(slab_map_t)0)
-    {
-        /* index can == capacity here, but check is skipped as this can only happen if slab is
-         * full, in which case next_free will not be used */
         slab->next_free = index + ctol(*entry);
-/* remove this assert after debugging & testing */
-assert( shm_slab_is_full( slab ) || slab->next_free < (int)slab->capacity );
-    }
     else
         slab->next_free = -(int)(index + SHM_SLAB_MAP_BITS);
+
+    /* It is possible here for slab->next_free == slab->capacity if the map has extra bits at the
+     * end of it. */
+    if (abs(slab->next_free) >= (int)slab->capacity)
+        slab->next_free = -1;
 
     info->shm_id = slab->id;
     info->offset = offset * sizeof(slab_niblet_t);
@@ -341,7 +350,8 @@ assert( shm_slab_is_full( slab ) || slab->next_free < (int)slab->capacity );
     return ptr;
 }
 
-/* Find the next free object and allocate it. Make sure the slab is not full prior to calling -- should never fail */
+/* Find the next free object and allocate it.  Make sure the slab is not full prior to calling --
+ * this should never fail.  */
 static slab_niblet_t *shm_slab_obj_alloc( struct shm_cache *cache, struct shm_slab *slab,
                                           struct shm_object_info *info )
 {
@@ -353,12 +363,13 @@ static slab_niblet_t *shm_slab_obj_alloc( struct shm_cache *cache, struct shm_sl
     if (next_free < 0)
         next_free = shm_slab_find_free( cache, slab, -next_free );
 
-    assert( next_free >= 0 ); /* this should never happen here */
+    assert( next_free >= 0 ); /* this should never fail here */
 
     return shm_slab_obj_do_alloc( cache, slab, next_free, info );
 }
 
-/* returns the index of the object the pointer referrs to or -1 if the slab doesn't contain this address */
+/* Returns the index of the object the pointer referrs to or -1 if the slab doesn't contain this
+ * address.  */
 static inline int shm_slab_ptr_to_index( struct shm_cache *cache, struct shm_slab *slab,
                                          const slab_niblet_t *ptr)
 {
@@ -390,6 +401,8 @@ static int shm_slab_obj_free( struct shm_cache *cache, struct shm_slab *slab, in
     --slab->count;
     *entry &= ~mask;
 
+    /* replace any hint with a sure answer, even if it leaves some holes closer to the start of the
+     * slab */
     if (slab->next_free < 0 || slab->next_free > index)
         slab->next_free = index;
 
@@ -403,17 +416,17 @@ static int shm_slab_obj_free( struct shm_cache *cache, struct shm_slab *slab, in
 
         /* mark memory as free */
         if (cache->flags & SHM_CACHE_POISON)
-            nibset( ptr, SHM_CACHE_FREE, cache->obj_size );
-//fprintf(stderr, "%s: %p\n", __func__, ptr);
+            nibset( ptr, SHM_SLAB_FREE, cache->obj_size );
     }
     return 0;
 }
 
 
-/*
- *              struct shm_cache Functions
+/*************************************************************************************************
+ *                              struct shm_cache Functions
  */
 
+/* Add a new slab to the cache. */
 static struct shm_slab *shm_cache_grow( struct shm_cache *cache, size_t slab_size )
 {
     struct shm_slab *slab = shm_slab_alloc( cache, slab_size );
@@ -428,7 +441,7 @@ static struct shm_slab *shm_cache_grow( struct shm_cache *cache, size_t slab_siz
     return slab;
 }
 
-/* calculate the initial slab size in niblets */
+/* Calculate the initial slab size in niblets.  */
 static inline size_t calc_slab_size( size_t initial_size )
 {
     const size_t page_size = get_page_size();
@@ -439,6 +452,7 @@ static inline size_t calc_slab_size( size_t initial_size )
     return ((initial_size + page_size - 1) & ~(page_size - 1)) / sizeof(slab_niblet_t);
 }
 
+/* Convert a byte size value to niblets, rounding up as needed.  */
 static inline size_t round_up_to_niblets( size_t val )
 {
     return (val + sizeof(slab_niblet_t) - 1) / sizeof(slab_niblet_t);
@@ -450,7 +464,7 @@ static inline size_t round_up_to_niblets( size_t val )
  * Allocate a new shared memory cache
  *
  * PARAMS
- *   obj_size      [I]  Size of objects this cache will allocate
+ *   obj_size      [I]  Size of objects this cache will allocate in bytes
  *   initial_size  [I]  The size of the initial slab in bytes
  *   flags         [I]  Flags (see below)
  *
@@ -473,6 +487,7 @@ struct shm_cache *shm_cache_alloc(size_t obj_size, size_t initial_size, int flag
     if (flags & SHM_CACHE_VERIFY_MEM)
         flags |= SHM_CACHE_POISON;
 
+    /* Convert to niblets.  */
     obj_size  = round_up_to_niblets( obj_size );
     if (obj_size < align)
         obj_size = align;
@@ -497,7 +512,7 @@ struct shm_cache *shm_cache_alloc(size_t obj_size, size_t initial_size, int flag
 
     if (!shm_cache_grow( cache, slab_size ))
     {
-        free(cache);
+        free( cache );
         return NULL;
     }
 
@@ -515,29 +530,28 @@ void shm_cache_free( struct shm_cache *cache )
     assert(!cache->count);
 
     while (!list_empty( &cache->slabs ))
-    {
-        struct shm_slab *slab = get_last_slab( cache );
-
-        list_remove( &slab->entry );
-        shm_slab_free( slab );
-    }
+        shm_slab_free( cache, get_last_slab( cache ) );
     memset( cache, 0xaa, sizeof(*cache) );
     free( cache );
 }
 
-static size_t calculate_next_slab_size( struct shm_cache *cache )
+static unsigned calculate_next_slab_size( struct shm_cache *cache )
 {
-    const size_t page_size_minus_one = get_page_size() / sizeof(slab_niblet_t) - 1;
+    const unsigned page_size_minus_one = get_page_size() / sizeof(slab_niblet_t) - 1;
+    const unsigned __int64 cur_size    = cache->capacity * get_store_size( cache );
 
     /* increase by roughly Phi */
-    size_t new_slab_size = cache->capacity * get_store_size( cache ) * 618 / 1000;
+    unsigned __int64 new_slab_size     = cur_size * 618034ll / 1000000ll;
+
+    /* For our purpose in Wine, we should never grow this large.  */
+    assert( cur_size + new_slab_size < 0xffffffffull );
 
     /* round up to the nearest page */
-    return (new_slab_size + page_size_minus_one) & ~page_size_minus_one;
+    return ((unsigned)new_slab_size + page_size_minus_one) & ~page_size_minus_one;
 }
 
-/* look for a free slab starting with the slab residing at the parameter start and wrap around to
- * the beginning of the list if needed. If start is NULL, then just start at the beginning of the
+/* Look for a free slab starting with the slab residing at the parameter start and wrap around to
+ * the beginning of the list if needed.  If start is NULL, then just start at the beginning of the
  * list. */
 static struct shm_slab *find_free_slab( struct shm_cache *cache, struct shm_slab *start )
 {
@@ -580,7 +594,7 @@ void *shm_cache_obj_alloc( struct shm_cache *cache, struct shm_object_info *info
     /* if next_free_slab doesn't actually have room then find another slab */
     if (!cache->next_free_slab || shm_slab_is_full( cache->next_free_slab ))
         cache->next_free_slab = find_free_slab( cache, cache->next_free_slab );
-    assert( cache->next_free_slab ); /* should never happen */
+    assert( cache->next_free_slab ); /* should never fail */
 
     ++cache->count;
 
@@ -601,7 +615,7 @@ static void shm_cache_try_shrink( struct shm_cache *cache )
     if (list_head( &cache->slabs ) == list_tail( &cache->slabs ))
         return;
 
-    /* try to free the smallest slab */
+    /* Try to free the smallest slab.  */
     LIST_FOR_EACH_ENTRY(slab, &cache->slabs, struct shm_slab, entry)
     {
         if (slab->count)
@@ -610,8 +624,7 @@ static void shm_cache_try_shrink( struct shm_cache *cache )
         cache->capacity -= slab->capacity;
         if (cache->next_free_slab == slab)
             cache->next_free_slab = NULL;
-        list_remove( &slab->entry );
-        shm_slab_free( slab );
+        shm_slab_free( cache, slab );
         return;
     }
 }
@@ -623,7 +636,7 @@ static void populate_info( struct shm_cache *cache, struct shm_slab *slab, unsig
     const size_t padding   = get_padding( cache );
     const size_t offset    = get_store_size( cache ) * index + padding;
 
-    assert( !(slab->slab_size % page_size) );
+    assert( !(slab->slab_size * sizeof(slab_niblet_t) % page_size) );
 
     info->shm_id = slab->id;
     info->offset = offset * sizeof(slab_niblet_t);
@@ -682,10 +695,26 @@ int shm_cache_get_info( struct shm_cache *cache, void *ptr, struct shm_object_in
 }
 
 /* free an object allocated from this cache */
+__attribute__((optimize(2)))
 int shm_cache_obj_free( struct shm_cache *cache, void **ptr )
 {
     struct shm_slab *slab;
     int index = shm_cache_obj_find( cache, &slab, *ptr, NULL );
+
+#if 0 /* HACK: for debugging... */
+    struct list *i;
+    LIST_FOR_EACH( i, &object_list )
+    {
+        struct object *o = LIST_ENTRY( i, struct object, obj_list );
+
+        if (o->ops->trywait_begin_trans)
+        {
+            struct hybrid_sync_object *hso = &((struct hybrid_server_object *)o)->any.ho;
+            slab_niblet_t *n = (slab_niblet_t*)hso->atomic.value;
+            assert (n != *ptr);
+        }
+    }
+#endif
 
     if (index == -1)
         return -1;
@@ -833,4 +862,4 @@ const char *shm_cache_dump( struct dump *dump, struct shm_cache *cache, int dump
 
     return dump->buffer;
 }
-#endif
+#endif /* SHM_SLAB_DEBUG */

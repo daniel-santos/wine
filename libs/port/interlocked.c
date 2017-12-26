@@ -96,6 +96,19 @@ carry:
     return 1;
 }
 
+__declspec(naked) int interlocked_test_and_reset_bit( volatile int *dest, int bit )
+{
+    __asm mov eax, 8[esp];
+    __asm mov edx, 4[esp];
+    __asm lock btr  [edx], eax;
+    __asm jc carry
+
+    return 0;
+
+carry:
+    return 1;
+}
+
 #else
 /* use gcc compatible asm code as default for __i386__ */
 
