@@ -10,6 +10,7 @@ C_SRCS = \
 	loader.c \
 	mmap.c \
 	port.c \
+	pretty_dump.c \
 	sortkey.c \
 	string.c \
 	wctype.c
