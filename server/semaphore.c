@@ -41,6 +41,16 @@
 #include "shm_slab.h"
 #include "wine/sync.h"
 
+union semaphore;
+struct semaphore_ops
+{
+    struct object_ops base;
+    /* Release the semaphore. */
+    int (*release)( union semaphore *sem, unsigned int count, unsigned int *prev );
+    /* Query semaphore value. */
+    void (*query)( union semaphore *sem, unsigned int *count, unsigned int *max );
+};
+
 struct private_semaphore
 {
     struct object  obj;    /* object header */
@@ -48,9 +58,15 @@ struct private_semaphore
     unsigned int   max;    /* maximum possible count */
 };
 
-union any_semaphore
+union semaphore
 {
-    struct object  obj;    /* common object header */
+    struct object  obj;                     /* common object header */
+    struct
+    {
+        unsigned int                 dummy0;
+        unsigned int                 dummy1;
+        const struct semaphore_ops  *ops;   /* object ops cast as semaphore_ops */
+    };
     struct private_semaphore private;
     struct hybrid_server_object shared;
 };
@@ -58,65 +74,82 @@ union any_semaphore
 /* Common semaphore functions.  */
 static struct object_type *semaphore_get_type( struct object *obj );
 static unsigned int semaphore_map_access( struct object *obj, unsigned int access );
+static int semaphore_signal( struct object *obj, unsigned int access );
 
 /* Private semaphore functions.  */
 static void private_semaphore_dump( struct object *obj, int verbose );
 static int private_semaphore_signaled( struct object *obj, struct wait_queue_entry *entry );
 static void private_semaphore_satisfied( struct object *obj, struct wait_queue_entry *entry );
-static int private_semaphore_signal( struct object *obj, unsigned int access );
+static int private_semaphore_release( union semaphore *sem, unsigned int count,
+                                      unsigned int *prev );
+static void private_semaphore_query( union semaphore *sem, unsigned int *count, unsigned int *max );
 
-static const struct object_ops private_semaphore_ops =
+static const struct semaphore_ops private_semaphore_ops =
 {
-    sizeof(union any_semaphore),   /* size */
-    private_semaphore_dump,        /* dump */
-    semaphore_get_type,            /* get_type */
-    add_queue,                     /* add_queue */
-    remove_queue,                  /* remove_queue */
-    private_semaphore_signaled,    /* signaled */
-    private_semaphore_satisfied,   /* satisfied */
-    private_semaphore_signal,      /* signal */
-    no_get_fd,                     /* get_fd */
-    semaphore_map_access,          /* map_access */
-    default_get_sd,                /* get_sd */
-    default_set_sd,                /* set_sd */
-    no_lookup_name,                /* lookup_name */
-    directory_link_name,           /* link_name */
-    default_unlink_name,           /* unlink_name */
-    no_open_file,                  /* open_file */
-    no_close_handle,               /* close_handle */
-    no_destroy                     /* destroy */
+    {
+        sizeof(union semaphore),       /* size */
+        private_semaphore_dump,        /* dump */
+        semaphore_get_type,            /* get_type */
+        add_queue,                     /* add_queue */
+        remove_queue,                  /* remove_queue */
+        private_semaphore_signaled,    /* signaled */
+        private_semaphore_satisfied,   /* satisfied */
+        semaphore_signal,              /* signal */
+        no_get_fd,                     /* get_fd */
+        semaphore_map_access,          /* map_access */
+        default_get_sd,                /* get_sd */
+        default_set_sd,                /* set_sd */
+        no_lookup_name,                /* lookup_name */
+        directory_link_name,           /* link_name */
+        default_unlink_name,           /* unlink_name */
+        no_open_file,                  /* open_file */
+        no_close_handle,               /* close_handle */
+        no_destroy,                    /* destroy */
+        NULL,                          /* trywait_begin_trans */
+        NULL,                          /* trywait_commit */
+        NULL                           /* trywait_rollback */
+    },
+    private_semaphore_release,         /* release */
+    private_semaphore_query            /* query */
 };
 
 /* Shared semaphore functions.  */
 static void shared_semaphore_dump( struct object *obj, int verbose );
 static void shared_semaphore_destroy(struct object *obj);
-static NTSTATUS shared_semaphore_trywait_begin_trans( struct object *obj, struct wait_queue_entry *entry );
+static NTSTATUS shared_semaphore_trywait_begin_trans( struct object *obj,
+                                                      struct wait_queue_entry *entry );
 static NTSTATUS shared_semaphore_trywait_commit( struct object *obj, int clear_notify );
 static NTSTATUS shared_semaphore_trywait_rollback( struct object *obj );
+static int shared_semaphore_release( union semaphore *sem, unsigned int count, unsigned int *prev );
+static void shared_semaphore_query( union semaphore *sem, unsigned int *count, unsigned int *max );
 
-static const struct object_ops shared_semaphore_ops =
+static const struct semaphore_ops shared_semaphore_ops =
 {
-    sizeof(union any_semaphore),          /* size */
-    shared_semaphore_dump,                /* dump */
-    semaphore_get_type,                   /* get_type */
-    add_queue,                            /* add_queue */
-    remove_queue,                         /* remove_queue */
-    NULL,                                 /* signaled */
-    NULL,                                 /* satisfied */
-    NULL,                                 /* signal */
-    no_get_fd,                            /* get_fd */
-    semaphore_map_access,                 /* map_access */
-    default_get_sd,                       /* get_sd */
-    default_set_sd,                       /* set_sd */
-    no_lookup_name,                       /* lookup_name */
-    directory_link_name,                  /* link_name */
-    default_unlink_name,                  /* unlink_name */
-    no_open_file,                         /* open_file */
-    process_group_close_handle,           /* close_handle */
-    shared_semaphore_destroy,             /* destroy */
-    shared_semaphore_trywait_begin_trans, /* trywait_begin_trans */
-    shared_semaphore_trywait_commit,      /* trywait_commit */
-    shared_semaphore_trywait_rollback     /* trywait_rollback */
+    {
+        sizeof(union semaphore),              /* size */
+        shared_semaphore_dump,                /* dump */
+        semaphore_get_type,                   /* get_type */
+        add_queue,                            /* add_queue */
+        remove_queue,                         /* remove_queue */
+        NULL,                                 /* signaled */
+        NULL,                                 /* satisfied */
+        semaphore_signal,                     /* signal */
+        no_get_fd,                            /* get_fd */
+        semaphore_map_access,                 /* map_access */
+        default_get_sd,                       /* get_sd */
+        default_set_sd,                       /* set_sd */
+        no_lookup_name,                       /* lookup_name */
+        directory_link_name,                  /* link_name */
+        default_unlink_name,                  /* unlink_name */
+        no_open_file,                         /* open_file */
+        process_group_close_handle,           /* close_handle */
+        shared_semaphore_destroy,             /* destroy */
+        shared_semaphore_trywait_begin_trans, /* trywait_begin_trans */
+        shared_semaphore_trywait_commit,      /* trywait_commit */
+        shared_semaphore_trywait_rollback     /* trywait_rollback */
+    },
+    shared_semaphore_release,                 /* release */
+    shared_semaphore_query                    /* query */
 };
 
 
@@ -140,12 +173,12 @@ static unsigned int semaphore_map_access( struct object *obj, unsigned int acces
     return access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
 }
 
-static union any_semaphore *create_semaphore( struct object *root, const struct unicode_str *name,
+static union semaphore *create_semaphore( struct object *root, const struct unicode_str *name,
                                            unsigned int attr, unsigned int initial, unsigned int max,
                                            const struct security_descriptor *sd,
                                            struct shm_object_info *info, int *private )
 {
-    union any_semaphore *sem;
+    union semaphore *sem;
     int req_private = *private;
     const struct object_ops *ops_array[2];
 
@@ -158,16 +191,16 @@ static union any_semaphore *create_semaphore( struct object *root, const struct 
     if (!have_shm() || !staging_sync_enabled())
         req_private = TRUE;
 
-    ops_array[0] = req_private ? &private_semaphore_ops : &shared_semaphore_ops;
-    ops_array[1] = req_private ? &shared_semaphore_ops  : &private_semaphore_ops;
+    ops_array[0] = req_private ? &private_semaphore_ops.base : &shared_semaphore_ops.base;
+    ops_array[1] = req_private ? &shared_semaphore_ops.base  : &private_semaphore_ops.base;
     if ((sem = create_named_polytype_object( root, ops_array, 2, name, attr, sd )))
     {
         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
         {
-            assert( !*private || sem->obj.ops == &private_semaphore_ops );
+            assert( !*private || sem->ops == &private_semaphore_ops );
 
             /* initialize it if it didn't already exist */
-            if (sem->obj.ops == &private_semaphore_ops)
+            if (sem->ops == &private_semaphore_ops)
             {
                 *private = TRUE;
                 sem->private.count = initial;
@@ -176,7 +209,7 @@ static union any_semaphore *create_semaphore( struct object *root, const struct 
             else
             {
                 NTSTATUS result;
-                assert( sem->obj.ops == &shared_semaphore_ops );
+                assert( sem->ops == &shared_semaphore_ops );
                 *private = FALSE;
 
                 if (hybrid_server_object_init( &sem->shared, info, current->process ))
@@ -197,6 +230,20 @@ exit_error:
     return sem;
 }
 
+static int semaphore_signal( struct object *obj, unsigned int access )
+{
+    union semaphore *sem = (union semaphore *)obj;
+    assert( sem->ops == &private_semaphore_ops || sem->ops == &shared_semaphore_ops);
+
+    if (!(access & SEMAPHORE_MODIFY_STATE))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return 0;
+    }
+    return sem->ops->release( sem, 1, NULL );
+}
+
+
 
 /*****************************************************************************
  *                  Private semaphore functions
@@ -205,29 +252,31 @@ exit_error:
 __cold static void private_semaphore_dump( struct object *obj, int verbose )
 {
     struct private_semaphore *sem = (struct private_semaphore *)obj;
-    assert( obj->ops == &private_semaphore_ops );
+    assert( obj->ops == &private_semaphore_ops.base );
     fprintf( stderr, "Semaphore count=%d max=%d\n", sem->count, sem->max );
 }
 
 static int private_semaphore_signaled( struct object *obj, struct wait_queue_entry *entry )
 {
     struct private_semaphore *sem = (struct private_semaphore *)obj;
-    assert( obj->ops == &private_semaphore_ops );
+    assert( obj->ops == &private_semaphore_ops.base );
     return (sem->count > 0);
 }
 
 static void private_semaphore_satisfied( struct object *obj, struct wait_queue_entry *entry )
 {
     struct private_semaphore *sem = (struct private_semaphore *)obj;
-    assert( obj->ops == &private_semaphore_ops );
+    assert( obj->ops == &private_semaphore_ops.base );
     assert( sem->count );
     sem->count--;
 }
 
-static int private_semaphore_release( struct private_semaphore *sem, unsigned int count,
+static int private_semaphore_release( union semaphore *generic_sem, unsigned int count,
                                       unsigned int *prev )
 {
-    assert( sem->obj.ops == &private_semaphore_ops );
+    struct private_semaphore *sem = (struct private_semaphore *)generic_sem;
+
+    assert( generic_sem->obj.ops == &private_semaphore_ops.base );
     if (prev) *prev = sem->count;
     if (sem->count + count < sem->count
         || sem->count + count > sem->max)
@@ -248,17 +297,13 @@ static int private_semaphore_release( struct private_semaphore *sem, unsigned in
     return 1;
 }
 
-static int private_semaphore_signal( struct object *obj, unsigned int access )
+static void private_semaphore_query( union semaphore *generic_sem, unsigned int *current,
+                                     unsigned int *max )
 {
-    struct private_semaphore *sem = (struct private_semaphore *)obj;
-    assert( obj->ops == &private_semaphore_ops );
-
-    if (!(access & SEMAPHORE_MODIFY_STATE))
-    {
-        set_error( STATUS_ACCESS_DENIED );
-        return 0;
-    }
-    return private_semaphore_release( sem, 1, NULL );
+    struct private_semaphore *sem = (struct private_semaphore *)generic_sem;
+    assert( generic_sem->obj.ops == &private_semaphore_ops.base );
+    *current = sem->count;
+    *max = sem->max;
 }
 
 
@@ -273,7 +318,7 @@ __cold static void shared_semaphore_dump( struct object *obj, int verbose )
     char buf[0x400];
     char *start = buf;
 
-    assert( obj->ops == &shared_semaphore_ops );
+    assert( obj->ops == &shared_semaphore_ops.base );
     hybrid_semaphore_dump( hs, &start, &buf[sizeof(buf)]);
     fprintf( stderr, "Semaphore %p any.sem = %s, refcount %u, process_group = %p ", obj, buf, obj->refcount, sem->process_group );
     fputc( '\n', stderr );
@@ -282,39 +327,39 @@ __cold static void shared_semaphore_dump( struct object *obj, int verbose )
 static void shared_semaphore_destroy(struct object *obj)
 {
     struct hybrid_server_object *sem = (struct hybrid_server_object *)obj;
-    assert( obj->ops == &shared_semaphore_ops );
-
+    assert( obj->ops == &shared_semaphore_ops.base );
     hybrid_server_object_destroy( sem );
 }
 
 static NTSTATUS shared_semaphore_trywait_begin_trans( struct object *obj, struct wait_queue_entry *wait )
 {
     struct hybrid_server_object *sem = (struct hybrid_server_object *)obj;
-    assert( obj->ops == &shared_semaphore_ops );
+    assert( obj->ops == &shared_semaphore_ops.base );
     return hybrid_semaphore_trywait_begin_trans( &sem->any.sem, &sem->trans_state );
 }
 
 static NTSTATUS shared_semaphore_trywait_commit( struct object *obj, int clear_notify )
 {
     struct hybrid_server_object *sem = (struct hybrid_server_object *)obj;
-    assert( obj->ops == &shared_semaphore_ops );
+    assert( obj->ops == &shared_semaphore_ops.base );
     return hybrid_semaphore_trywait_commit( &sem->any.sem, &sem->trans_state, clear_notify );
 }
 
 static NTSTATUS shared_semaphore_trywait_rollback( struct object *obj )
 {
     struct hybrid_server_object *sem = (struct hybrid_server_object *)obj;
-    assert( obj->ops == &shared_semaphore_ops );
+    assert( obj->ops == &shared_semaphore_ops.base );
     return hybrid_semaphore_trywait_rollback( &sem->any.sem, &sem->trans_state );
 }
 
-#if 0
-static int shared_release_semaphore( struct hybrid_server_object *sem, unsigned int count, unsigned int *prev_ret )
+static int shared_semaphore_release( union semaphore *generic_sem, unsigned int count,
+                                     unsigned int *prev_ret )
 {
+    struct hybrid_server_object *sem = (struct hybrid_server_object *)generic_sem;
     unsigned int prev;
     NTSTATUS ret;
 
-    assert( sem->obj.ops == &shared_semaphore_ops );
+    assert( generic_sem->obj.ops == &shared_semaphore_ops.base );
     ret = hybrid_semaphore_release( &sem->any.sem, count, &prev );
     if (prev_ret)
         *prev_ret = prev;
@@ -324,10 +369,21 @@ static int shared_release_semaphore( struct hybrid_server_object *sem, unsigned 
     else if (!prev)
         wake_up( &sem->obj, count );
 
+    hybrid_server_object_check( sem );
+
     return !ret;
 }
-#endif
 
+static void shared_semaphore_query( union semaphore *generic_sem, unsigned int *current,
+                                    unsigned int *max )
+{
+    NTSTATUS result;
+    struct hybrid_server_object *sem = (struct hybrid_server_object *)generic_sem;
+    assert( generic_sem->ops == &shared_semaphore_ops );
+    if ((result = hybrid_server_object_query( sem, current )))
+        set_error( result );
+    *max = sem->any.sem.max;
+}
 
 /*****************************************************************************
  *                  Request Handlers
@@ -336,7 +392,7 @@ static int shared_release_semaphore( struct hybrid_server_object *sem, unsigned 
 /* create a semaphore */
 DECL_HANDLER(create_semaphore)
 {
-    union any_semaphore *sem;
+    union semaphore *sem;
     struct unicode_str name;
     struct object *root;
     const struct security_descriptor *sd;
@@ -371,7 +427,7 @@ DECL_HANDLER(open_semaphore)
     struct shm_object_info info = shm_object_info_init( );
 
     reply->handle = shared_object_open( current->process, req->rootdir, req->access,
-                                        &private_semaphore_ops, &shared_semaphore_ops,
+                                        &private_semaphore_ops.base, &shared_semaphore_ops.base,
                                         &name, req->attributes, &info );
 
     reply->private = info.private;
@@ -383,26 +439,13 @@ DECL_HANDLER(open_semaphore)
 /* release a semaphore */
 DECL_HANDLER(release_semaphore)
 {
-    const struct object_ops *ops[2] = {&private_semaphore_ops, &shared_semaphore_ops};
-    union any_semaphore *sem;
+    const struct object_ops *ops[2] = {&private_semaphore_ops.base, &shared_semaphore_ops.base};
+    union semaphore *sem;
 
-    if ((sem = (union any_semaphore *)get_handle_polytype_obj( current->process, req->handle,
-                                                               SEMAPHORE_MODIFY_STATE, ops, 2 )))
+    if ((sem = (union semaphore *)get_handle_polytype_obj( current->process, req->handle,
+                                                           SEMAPHORE_MODIFY_STATE, ops, 2 )))
     {
-        if (sem->obj.ops == &private_semaphore_ops)
-            private_semaphore_release( &sem->private, req->count, &reply->prev_count );
-        else
-        {
-#if 1
-            /* Client should perform locally.  */
-            fprintf( stderr, "wineserver: WARNING: %s called for shared semaphore.\n", __func__ );
-            set_error( STATUS_NOT_IMPLEMENTED );
-            assert(0);
-#else
-            shared_release_semaphore( &sem->shared, req->count, &reply->prev_count );
-            hybrid_server_object_check( &sem->shared );
-#endif
-        }
+        sem->ops->release( sem, req->count, &reply->prev_count);
         release_object( &sem->obj );
     }
 }
@@ -410,31 +453,13 @@ DECL_HANDLER(release_semaphore)
 /* query details about the semaphore */
 DECL_HANDLER(query_semaphore)
 {
-    const struct object_ops *ops[2] = {&private_semaphore_ops, &shared_semaphore_ops};
-    union any_semaphore *sem;
+    const struct object_ops *ops[2] = {&private_semaphore_ops.base, &shared_semaphore_ops.base};
+    union semaphore *sem;
 
-    if ((sem = (union any_semaphore *)get_handle_polytype_obj( current->process, req->handle,
-                                                               SEMAPHORE_QUERY_STATE, ops, 2 )))
+    if ((sem = (union semaphore *)get_handle_polytype_obj( current->process, req->handle,
+                                                           SEMAPHORE_QUERY_STATE, ops, 2 )))
     {
-        if (sem->obj.ops == &private_semaphore_ops)
-        {
-            reply->current = sem->private.count;
-            reply->max = sem->private.max;
-        }
-        else
-        {
-#if 1
-            /* Client should perform query locally.  */
-            fprintf( stderr, "wineserver: WARNING: %s called for shared semaphore.\n", __func__ );
-            set_error( STATUS_NOT_IMPLEMENTED );
-            assert(0);
-#else
-            asm volatile( "":::"memory" );
-            reply->current = sem->shared.any.ho.atomic.value->data;
-            reply->max = sem->shared.any.sem.max;
-            hybrid_server_object_check( &sem->shared );
-#endif
-        }
+        sem->ops->query( sem, &reply->current, &reply->max );
         release_object( &sem->obj );
     }
 }

@@ -337,6 +337,7 @@ extern int hybrid_server_object_get_info( struct hybrid_server_object *hso, stru
 extern int hybrid_server_object_migrate( struct hybrid_server_object *hso, struct shm_object_info *info );
 extern NTSTATUS hybrid_server_object_clear_notify( struct hybrid_server_object *hso );
 extern void __hybrid_server_object_check_bad( void );
+extern NTSTATUS hybrid_server_object_query( struct hybrid_server_object *hso, unsigned int *value );
 
 static inline int type_is_shared_object( struct object *obj )
 {
