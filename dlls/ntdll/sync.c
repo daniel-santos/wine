@@ -292,7 +292,6 @@ NTSTATUS WINAPI NtCreateSemaphore( OUT PHANDLE SemaphoreHandle,
         ret = wine_server_call( req );
         *SemaphoreHandle = wine_server_ptr_handle( reply->handle );
         info.private     = reply->private;
-        assert( !(access & SYNC_OBJECT_ACCESS_SERVER_ONLY) || info.private );
         info.shm_id      = reply->shm_id;
         info.offset      = reply->offset;
 

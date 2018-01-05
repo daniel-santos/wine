@@ -215,8 +215,8 @@ NTSTATUS hybrid_server_object_query( struct hybrid_server_object *hso, unsigned 
     if (check_data( &hso->any.ho, &val, FALSE, FALSE ) == SHM_SYNC_VALUE_CORRUPTED)
         return STATUS_FILE_CORRUPT_ERROR;
 
-    /* These conditions should never occur outside of check_wait and the migration process.  So if
-     * they are set and the hash is good, then we have a problem. */
+    /* These conditions should never occur outside of check_wait (in server/thread.c) and the
+     * migration process.  So if they are set and the hash is good, then we have a problem. */
     assert (!(val.flags_hash & (SHM_SYNC_VALUE_MOVED | SHM_SYNC_VALUE_LOCKED)));
 
     return STATUS_SUCCESS;
