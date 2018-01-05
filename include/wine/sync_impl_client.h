@@ -579,7 +579,7 @@ static enum shm_sync_value_result hybrid_object_wait_global_lock(struct hybrid_s
             return result;
         }
 
-        if (likely(spincount))
+        if (spincount)
         {
             --spincount;
             cpu_relax();    /* use less power if CPU is capable */

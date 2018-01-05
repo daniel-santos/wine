@@ -335,7 +335,6 @@ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJEC
         ret              = wine_server_call( req );
         *handle = wine_server_ptr_handle( reply->handle );
         info.private     = reply->private;
-        assert( !(access & SYNC_OBJECT_ACCESS_SERVER_ONLY) || info.private );
         info.shm_id      = reply->shm_id;
         info.offset      = reply->offset;
 
@@ -351,7 +350,7 @@ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJEC
 NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS class,
                                   void *info, ULONG len, ULONG *ret_len )
 {
-    NTSTATUS ret;
+    NTSTATUS ret = STATUS_SUCCESS;
     SEMAPHORE_BASIC_INFORMATION *out = info;
     struct ntdll_object *obj;
 

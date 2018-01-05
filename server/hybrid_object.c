@@ -204,3 +204,20 @@ obj_handle_t shared_object_open( struct process *process, obj_handle_t parent,
 
     return h;
 }
+
+NTSTATUS hybrid_server_object_query( struct hybrid_server_object *hso, unsigned int *value )
+{
+    union shm_sync_value val;
+
+    val.int64 = locked_read64( &hso->any.ho.atomic.value->int64 );
+    *value = val.data;
+
+    if (check_data( &hso->any.ho, &val, FALSE, FALSE ) == SHM_SYNC_VALUE_CORRUPTED)
+        return STATUS_FILE_CORRUPT_ERROR;
+
+    /* These conditions should never occur outside of check_wait and the migration process.  So if
+     * they are set and the hash is good, then we have a problem. */
+    assert (!(val.flags_hash & (SHM_SYNC_VALUE_MOVED | SHM_SYNC_VALUE_LOCKED)));
+
+    return STATUS_SUCCESS;
+}
