@@ -336,7 +336,7 @@ void read_request( struct thread *thread )
         if ((ret = read( get_unix_fd( thread->request_fd ), &thread->req,
                          sizeof(thread->req) )) != sizeof(thread->req)) goto error;
 
-        if (thread->req.request_header.reply_size & SERVER_REQUEST_REPLY_SIZE_POST)
+        if (thread->req.request_header.reply_size == SERVER_REQUEST_REPLY_SIZE_POST)
             async = 1;
         if (!(thread->req_toread = thread->req.request_header.request_size))
         {

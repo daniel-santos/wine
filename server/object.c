@@ -51,7 +51,7 @@ struct namespace
 
 
 #ifdef DEBUG_OBJECTS
-#if 1 /* HACK: for shm_slab debugging.  */
+#ifndef SHM_SLAB_DEBUG_EXPENSIVE /* HACK: for shm_slab debugging.  */
 static
 #endif
 struct list object_list = LIST_INIT(object_list);

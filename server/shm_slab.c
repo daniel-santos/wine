@@ -31,7 +31,7 @@
 #include "thread.h"
 #include "file.h"
 
-#if 0
+#ifdef SHM_SLAB_DEBUG_EXPENSIVE
 /* HACK: For debugging only. */
 #include "object.h"
 #endif
@@ -163,7 +163,7 @@ static struct shm_slab *shm_slab_alloc( struct shm_cache *cache, size_t slab_siz
 /* free a shm_slab object and it's associated shared memory */
 static void shm_slab_free( struct shm_cache *cache, struct shm_slab *slab)
 {
-#if 0 /* HACK: for debugging... */
+#ifdef SHM_SLAB_DEBUG_EXPENSIVE /* HACK: for debugging... */
     struct list *i;
     LIST_FOR_EACH( i, &object_list )
     {
@@ -701,7 +701,7 @@ int shm_cache_obj_free( struct shm_cache *cache, void **ptr )
     struct shm_slab *slab;
     int index = shm_cache_obj_find( cache, &slab, *ptr, NULL );
 
-#if 0 /* HACK: for debugging... */
+#ifdef SHM_SLAB_DEBUG_EXPENSIVE /* HACK: for debugging... */
     struct list *i;
     LIST_FOR_EACH( i, &object_list )
     {

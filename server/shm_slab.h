@@ -30,8 +30,13 @@
 #include "wine/sync.h"
 
 #define SHM_SLAB_DEBUG
+//#define SHM_SLAB_DEBUG_EXPENSIVE
 #ifdef SHM_SLAB_DEBUG
 # include "wine/pretty_dump.h"
+#endif
+
+#ifdef SHM_SLAB_DEBUG_EXPENSIVE
+extern struct list object_list;
 #endif
 
 

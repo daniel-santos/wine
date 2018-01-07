@@ -901,6 +901,7 @@ wait_unsatisfied:
 /* HACK: Temporary debug wrapper to verify state of hybrid objects */
 static int check_wait( struct thread *thread )
 {
+    unsigned value;
     struct thread_wait *wait = thread->wait;
     int result = real_check_wait( thread );
     int i;
@@ -910,13 +911,7 @@ static int check_wait( struct thread *thread )
         struct object *obj = wait->queues[i].obj;
 
         if (type_is_shared_object( obj ))
-        {
-            struct hybrid_server_object *hso = (void*)obj;
-            union shm_sync_value value;
-            barrier();
-            value = *(volatile union shm_sync_value*)hso->any.ho.atomic.value;
-            assert(! (value.flags_hash & (SHM_SYNC_VALUE_LOCKED | SHM_SYNC_VALUE_MOVED)));
-        }
+            hybrid_server_object_query ((struct hybrid_server_object*)obj, &value);
     }
 
     return result;

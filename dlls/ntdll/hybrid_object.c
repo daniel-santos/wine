@@ -121,7 +121,7 @@ static inline void __rwlock_end( pthread_rwlock_t *rwlock, sigset_t *sigset, con
 #define rwlock_end(         rwlock, sigset ) __rwlock_end(         rwlock, sigset, __FILE__, __LINE__ )
 
 /*
- *      Hybrid Migratory Userspace Ojbects
+ *      Shared Hybrid Migratory Userspace Ojbects
  *
  * Definitions
  * ===========
@@ -162,55 +162,10 @@ static inline void __rwlock_end( pthread_rwlock_t *rwlock, sigset_t *sigset, con
  * Client object to server object mapping
  * --------------------------------------
  *
- * There are a number of ways for a single process to obtain multiple handles to a the same object.
- * However, this design maps a single ntdll_object to a single handle. This is currently managed by
- * the fact client-private objects are not currently supported and multiple ntdll_objects operating
- * on the same shared memory behave the same as if
- * that client-private objects (i.e., objects where no shared memory is used and
- * Currently, each handle that a process has gets its own
- * ntdll_object. This
- * It is possible to have more than one handle to a single object
- *
- * Lifecycle of a struct ntdll_object object
- *
- * EDIT: we now use a combination of refcount and the HYBRID_SYNC_ACCESSIBLE bit in
- * struct struct hybrid_sync_object::flags_refcount.
- *
- * Rather than using a refcount
- * Below is an example of an object's lifecycle.
- *
- * Accesible  Refcount     Operation
- * (no object)              Execute a server call that creates an object & returns a handle.
- * 1            Call ntdll_object_new() passing handle to allocate a new struct ntdll_object.
- *              * allocates & zeros struct ntdll_object
- *              * adds to objects.list (double-linked list)
- * 1            Initialize derived-type data members
- * 2            Call ntdll_handle_add() to index handle in handles.tree (red-black tree)
- * 1            Call ntdll_object_release() when done with the object.
- * ....
- * (no object)  We receive an API call that we might be able to manage client-side
- * 2            Call ntdll_handle_find() on the handle and get the object
- * 2            Perform whatever we need to do locally
- * 1            Call ntdll_object_release() when done with the object.
- * ...
- * (no object)  We receive a call to NtClose (CloseHandle)
- * 2            Call ntdll_handle_find() on the handle and get the object
- * 1            Call ntdll_handle_remove() to remove it from handles.tree.
- * 0            Call ntdll_object_release()
- *              * object is removed from list
- *              * refcount reaches zero and destructor type->close() is called
- *              * memory is freed
- *
- * Because we're doing this in the multi-threaded environment of the client process instead of
- * the safety of the single-threaded server, things won't always go as above. It is possible
- * for a call to NtClose to be received while another thread is still using the object, so
- * that the object returned by Call ntdll_handle_find() may have a refcount of 3 or more.
- * However, the object should be immediately delisted, so we can have many live objects
- * with the same handle, but only one of those handles (the one in the tree) is the living
- * one.
- *
- * TODO: Make sure that UB is acceptable for when a program tries to use a stale handle, or
- * should we zero the handle when it's removed from the tree (NtClose returns).
+ * There are many ways for a single process to obtain multiple handles to a the same object.
+ * This implementation maps a single ntdll_object to a single handle.  Multiple ntdll_objects may
+ * exist in the same process that utilize the same shared memory location such that concurrency is
+ * no different than two processes accessing the same object in shared memory.
  */
 
 
@@ -468,7 +423,7 @@ NTSTATUS __must_check ntdll_object_grab(struct ntdll_object *obj)
  */
 NTSTATUS __must_check ntdll_object_release(struct ntdll_object *obj)
 {
-    NTSTATUS ret = hybrid_object_release( &obj->any.ho, FALSE );
+    NTSTATUS ret = hybrid_object_release( &obj->any.ho, FALSE, NULL );
     if (ret)
         ERR_(ntdllobj)("hybrid_object_release failed with %08x", ret);
 
@@ -761,23 +716,34 @@ __attribute__((noinline)) NTSTATUS ntdll_handle_add(struct ntdll_object *obj)
  *  handles.rwlock
  */
 __attribute__((noinline))
-NTSTATUS ntdll_handle_remove(const HANDLE h)
+NTSTATUS ntdll_handle_remove( const HANDLE h )
 {
-    struct ntdll_object *obj = ntdll_handle_find(h);
+    struct ntdll_object *obj = ntdll_handle_find( h );
+    unsigned refs;
+    NTSTATUS ret;
     //NTSTATUS result, result_release;
     //int accessible;
     sigset_t sigset;
 
     if (!obj)
-        return STATUS_SUCCESS;
+        return STATUS_INVALID_HANDLE;
 
-    TRACE_(ntdllobj)("h = %p, obj = %s\n", h, ntdll_object_dump(obj));
+    TRACE_(ntdllobj)("h = %p, obj = %s\n", h, ntdll_object_dump( obj ));
 
-    rwlock_begin_write(&handles.rwlock, &sigset);
-    wine_rb_remove(&handles.tree, &obj->tree_entry);
-    rwlock_end(&handles.rwlock, &sigset);
+    rwlock_begin_write( &handles.rwlock, &sigset );
+    wine_rb_remove( &handles.tree, &obj->tree_entry );
+    rwlock_end( &handles.rwlock, &sigset );
 
-    return hybrid_object_release( &obj->any.ho, TRUE );
+    ret = hybrid_object_release( &obj->any.ho, TRUE, &refs );
+    if (!ret && !refs)
+    SERVER_START_REQ( close_handle )
+    {
+        req->handle = wine_server_obj_handle( h );
+        ret = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+
+    return ret;
 }
 
 /*************************************************************************
@@ -801,7 +767,7 @@ NTSTATUS ntdll_handle_remove(const HANDLE h)
  *  handles.rwlock
  *
  */
-struct ntdll_object *ntdll_handle_find(const HANDLE h)
+struct ntdll_object *ntdll_handle_find( const HANDLE h )
 {
     struct wine_rb_entry *entry;
     struct ntdll_object *ret = NULL;

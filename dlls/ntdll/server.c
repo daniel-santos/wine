@@ -681,21 +681,17 @@ release_object:
     TRACE_(ntdllsync)("select_op = %p, size = %u, flags = 0x%x, timeout = %p (%lld)\n",
                        select_op, size, flags, timeout, (timeout ? (long long)timeout->QuadPart : 0LL));
 
-#if 1
     if (nb_shared_objects == 0)
         goto do_server_call;
     else if (select_op->op == SELECT_WAIT || (select_op->op == SELECT_WAIT_ALL && nb_handles == 1))
-#else
-    if (select_op && nb_handles == 1 && (select_op->op == SELECT_WAIT || select_op->op == SELECT_WAIT_ALL))
-#endif
     {
         ssize_t i;
         ssize_t wait_object = 0;
         int do_server_call = 1;
-
+//fprintf(stderr, "%s: attempting local\n", __func__);
         ret = STATUS_UNSUCCESSFUL;
 
-        TRACE_(ntdllsync)("%zd/%zd objects are locally selectable, need %s.\n",
+        TRACE_(ntdllsync)("%zd/%zd objects are shared, need %s.\n",
                           nb_shared_objects, nb_handles,
                           (select_op->op == SELECT_WAIT ? "any" : "all"));
 
@@ -715,7 +711,7 @@ release_object:
 
         /* bWaitAll = FALSE */
         /* If we did this right then this can't happen.  */
-        assert (select_op->op != SELECT_WAIT_ALL);
+        assert (select_op->op == SELECT_WAIT);
 
         /* WaitForMultipleObjectsEx with bWaitAll = FALSE must go in order */
         for (i = 0; i < nb_handles; ++i)
@@ -780,7 +776,6 @@ local_done:
     if (TRACE_ON(ntdllsync) && select_op && (select_op->op == SELECT_WAIT
                                           || select_op->op == SELECT_WAIT_ALL))
         TRACE_(ntdllsync)("Doing server call.\n");
-
 do_server_call:
     for (;;)
     {
