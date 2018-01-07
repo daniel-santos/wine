@@ -83,7 +83,7 @@ static FORCEINLINE NTSTATUS hybrid_object_trans_op( struct hybrid_sync_object *h
 {
     enum shm_sync_value_result result;
     union shm_sync_value new_val;
-    NTSTATUS ret = STATUS_SUCCESS;
+    NTSTATUS ret;
     int is_begin_trans = (op == HYBRID_SYNC_TRANS_OP_BEGIN);
 
     if (is_begin_trans && last_server_cpu_ptr)
@@ -101,6 +101,7 @@ again:
         int locked         = pre_ptr->flags_hash & SHM_SYNC_VALUE_LOCKED;
         new_val.data       = pre_ptr->data;
         new_val.flags_hash = pre_ptr->flags_hash & SHM_SYNC_VALUE_FLAGS_MASK;
+        ret                = STATUS_SUCCESS;
 
         if (!!is_begin_trans ^ !locked)
         {
