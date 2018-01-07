@@ -25,13 +25,18 @@
 
 /**************** client-only functions ****************/
 
-static __must_check NTSTATUS hybrid_object_release(struct hybrid_sync_object *ho, int delist);
-static __must_check NTSTATUS hybrid_object_grab(struct hybrid_sync_object *ho);
-static __must_check NTSTATUS hybrid_object_do_move( struct hybrid_sync_object *ho, union hso_atomic *pre );
-static __noinline void hybrid_object_do_move_wait(struct hybrid_sync_object *ho, union hso_atomic *pre);
-static enum shm_sync_value_result hybrid_object_wait_global_lock(struct hybrid_sync_object *ho,
-                                                                 union shm_sync_value *pre_ptr);
-typedef enum shm_sync_value_result (*hso_client_op_callback_t)(union hso_atomic *pre, union hso_atomic *_new, NTSTATUS *ret);
+static __must_check NTSTATUS hybrid_object_release( struct hybrid_sync_object *ho, int delist,
+                                                    unsigned *refs );
+static __must_check NTSTATUS hybrid_object_grab( struct hybrid_sync_object *ho );
+static __must_check NTSTATUS hybrid_object_do_move( struct hybrid_sync_object *ho,
+                                                    union hso_atomic *pre );
+static __noinline void hybrid_object_do_move_wait( struct hybrid_sync_object *ho,
+                                                   union hso_atomic *pre );
+static enum shm_sync_value_result hybrid_object_wait_global_lock( struct hybrid_sync_object *ho,
+                                                                  union shm_sync_value *pre_ptr );
+typedef enum shm_sync_value_result (*hso_client_op_callback_t)( union hso_atomic *pre,
+                                                                union hso_atomic *_new,
+                                                                NTSTATUS *ret );
 
 /* cold portion of check_data */
 
@@ -348,15 +353,24 @@ static __must_check NTSTATUS hybrid_object_grab(struct hybrid_sync_object *ho)
  *
  * fast path built with gcc on x86_64 is 61 bytes
  */
-static __must_check NTSTATUS hybrid_object_release(struct hybrid_sync_object *ho, int delist)
+static __must_check NTSTATUS hybrid_object_release( struct hybrid_sync_object *ho, int delist,
+                                                    unsigned *refs )
 {
     union hso_atomic pre = ho->atomic;
+    unsigned refcount;
+    unsigned waiters;
     NTSTATUS result;
 
     result = hso_client_op( ho, &pre, delist ? HSO_CLIENT_OP_RELEASE_DELIST : HSO_CLIENT_OP_RELEASE, NULL, NULL );
+    refcount = hso_atomic_get_refcount( &pre );
+    waiters = hso_atomic_get_waitcount( &pre );
+    /* There should always be at least one reference and we should never call this function while
+     * the current thread is a "waiter" (i.e., waiting for another thread to perform migration). */
+    assert( refcount );
+    if (refs)
+        *refs = refcount + waiters - 1;
     if (!(hso_atomic_get_flags( &pre ) & (HYBRID_SYNC_ACCESSIBLE | HYBRID_SYNC_LOCKED))
-            && hso_atomic_get_refcount( &pre ) == 1
-            && hso_atomic_get_waitcount( &pre ) == 0)
+            && refcount == 1 && waiters == 0)
         hybrid_object_client_fns.destroy( ho );
 
     return result;

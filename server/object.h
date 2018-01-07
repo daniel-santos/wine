@@ -32,9 +32,6 @@
 #include "wine/sync.h"
 
 #define DEBUG_OBJECTS
-#if 0 /* HACK: for shm_slab debugging.  */
-extern struct list object_list;
-#endif
 
 /* kernel objects */
 

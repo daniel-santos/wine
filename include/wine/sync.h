@@ -26,8 +26,8 @@
  * Outstanding Issues and TODOs
  * ----------------------------
  *
- * o Client uses a separate hybrid_object for each handle instead of properly managing
- *   a one (object) to many (handles) relationship in the handles tree.  This can work
+ * o Client uses a separate hybrid_object for each handle instead of managing a one
+ *   one-to-many (objects to handles) relationship in the handles tree.  This can work
  *   fine as long as the server is keeping track of how many handles the client has,
  *   but it should be reexamined at some point.
  *
