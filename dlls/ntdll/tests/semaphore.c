@@ -936,6 +936,12 @@ static inline unsigned char interlocked_cmpxchg128( __int64 *dest, __int64 xchg_
                             "c" (xchg_high), "b" (xchg_low) );
     return ret;
 }
+#else
+static inline unsigned char __attribute((error("oops")))
+interlocked_cmpxchg128( __int64 *dest, __int64 xchg_high, __int64 xchg_low, __int64 *compare )
+{
+    assert(0);
+}
 #endif
 
 static char debug_read_sem( struct ntdll_object *o)
