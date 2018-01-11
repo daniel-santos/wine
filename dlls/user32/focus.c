@@ -376,7 +376,7 @@ HWND WINAPI GetForegroundWindow(void)
 
     if (shm)
     {
-        epoch = shm->foreground_wnd_epoch;
+        epoch = interlocked_xchg_add( (int*)&shm->foreground_wnd_epoch, 0 );
 
         if (epoch == thread_info->foreground_wnd_epoch)
             return thread_info->foreground_wnd;
