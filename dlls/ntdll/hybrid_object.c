@@ -971,9 +971,9 @@ NTSTATUS ntdll_object_db_init(void)
 	RtlFreeHeap(GetProcessHeap(), 0, img);
 	RtlFreeHeap(GetProcessHeap(), 0, imgs);
 
-        sync_impl_init( ntdll_object_move, ntdll_object_destroy, ntdll_object_server_wake,
-                        &shmglobal->last_server_cpu);
     }
+    sync_impl_init( ntdll_object_move, ntdll_object_destroy, ntdll_object_server_wake,
+                    shmglobal ? &shmglobal->last_server_cpu : NULL );
 
     TRACE_(ntdllobj)("\n");
 
