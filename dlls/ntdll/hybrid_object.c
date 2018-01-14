@@ -639,7 +639,7 @@ __attribute__((noinline)) NTSTATUS ntdll_handle_add(struct ntdll_object *obj)
 	union hso_atomic pre = ho->atomic;
 	//fprintf(stderr, "asdf flags_refcount %08x\n", ho->atomic.flags_refcount);
 	//assert (ho->atomic.flags_refcount >> 4 == 1);
-	ret = hso_client_op( ho, &pre, HSO_CLIENT_OP_LIST, NULL, NULL );
+	ret = hso_client_op( ho, &pre, TRUE, HSO_CLIENT_OP_LIST, NULL, NULL );
 
 	//if (!ret)
 //	    assert (ho->atomic.flags_refcount & HYBRID_SYNC_ACCESSIBLE);

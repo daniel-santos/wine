@@ -20,23 +20,16 @@
 
 #include "wine/sync_impl_common.h"
 
-// struct hso_client_opdata {}; */
-
-
-/**************** client-only functions ****************/
-
-static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_release( struct hybrid_sync_object *ho,
-                                                           int delist, unsigned *refs );
-static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_grab( struct hybrid_sync_object *ho );
-static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_do_move( struct hybrid_sync_object *ho,
-                                                           union hso_atomic *pre );
-static DECLSPEC_NOINLINE void hybrid_object_do_move_wait( struct hybrid_sync_object *ho,
-                                                          union hso_atomic *pre );
-static enum shm_sync_value_result hybrid_object_wait_global_lock( struct hybrid_sync_object *ho,
-                                                                  union shm_sync_value *pre );
-typedef enum shm_sync_value_result (*hso_client_op_callback_t)( union hso_atomic *pre,
-                                                                union hso_atomic *_new,
-                                                                NTSTATUS *ret );
+static DECLSPEC_MUST_CHECK NTSTATUS
+hybrid_object_release( struct hybrid_sync_object *ho, int delist, unsigned *refs );
+static DECLSPEC_MUST_CHECK NTSTATUS
+hybrid_object_grab( struct hybrid_sync_object *ho );
+static DECLSPEC_MUST_CHECK NTSTATUS
+hybrid_object_do_move( struct hybrid_sync_object *ho, union hso_atomic *pre );
+static DECLSPEC_NOINLINE void
+hybrid_object_do_move_wait( struct hybrid_sync_object *ho, union hso_atomic *pre );
+static enum shm_sync_value_result
+hybrid_object_wait_global_lock( struct hybrid_sync_object *ho, union shm_sync_value *pre );
 
 /* cold portion of check_data */
 
@@ -114,24 +107,43 @@ enum hso_client_op_enum {
  * 	STATUS_TOO_MANY_THREADS		Only on HSO_CLIENT_OP_GRAB
  */
 static DECLSPEC_MUST_CHECK NTSTATUS
-hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_client_op_enum op,
-               union shm_sync_value **ret_value, union shm_sync_value *new_value )
+hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, int maybe_stale,
+               enum hso_client_op_enum op, union shm_sync_value **ret_value,
+               union shm_sync_value *new_value )
 {
     unsigned long old;
-    union hso_atomic _new;
-
+    unsigned long _new;
+    NTSTATUS ret;
 
     //fprintf(stderr, "hso_client_op START, %p, %p, %d\n", ho, pre, op);
 
+    if (0)
+    {
+again:
+        pre->flags_refcounts = interlocked_cmpxchg_long( (long*)&ho->atomic.flags_refcounts,
+                                                         pre->flags_refcounts,
+                                                         pre->flags_refcounts );
+        /* Not really needed, but keeping consistiency. */
+        pre->value = ho->atomic.value;
+        maybe_stale = FALSE;
+    }
     do {
         unsigned long flags    = hso_atomic_get_flags( pre );
 	unsigned long refcount = hso_atomic_get_refcount( pre );
         unsigned long waiters  = hso_atomic_get_waitcount( pre );
-
+        ret = STATUS_SUCCESS;
 
 	/* Validate accessible bit.  */
 	if (op == HSO_CLIENT_OP_LIST)
-	    assert( !(flags & HYBRID_SYNC_ACCESSIBLE) );
+        {
+            if (flags & HYBRID_SYNC_ACCESSIBLE)
+            {
+                if (maybe_stale)
+                    goto again;
+                else
+                    assert( !(flags & HYBRID_SYNC_ACCESSIBLE) );
+            }
+        }
 	else if (!(flags & HYBRID_SYNC_ACCESSIBLE))
 	    switch (op)
 	    {/* FIXME: dunno */
@@ -143,22 +155,35 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
 	/* Validate refcount.  */
 	switch (op) {
 	case HSO_CLIENT_OP_LIST:
-	    assert( refcount == 1 );
-	    break;
 	case HSO_CLIENT_OP_UNLOCK:
-	    assert( refcount == 1 );
+            if (refcount == 1)
+                break;
+            if (maybe_stale)
+                goto again;
+            else
+                assert( refcount == 1 );
 	    break;
 
         case HSO_CLIENT_OP_LOCK_WAIT_END:
-            assert( waiters > 0 );
+            if (waiters > 0)
+                break;
+            if (maybe_stale)
+                goto again;
+            else
+                assert( waiters > 0 );
             break;
 
         case HSO_CLIENT_OP_LOCK_WAIT_BEGIN:
 	case HSO_CLIENT_OP_LOCK:
 	case HSO_CLIENT_OP_RELEASE:
 	case HSO_CLIENT_OP_RELEASE_DELIST:
-	    assert( refcount > 0 );
-	    break;
+            if (refcount > 0)
+                break;
+            if (maybe_stale)
+                goto again;
+            else
+                assert( refcount > 0 );
+            break;
 
 	case HSO_CLIENT_OP_GRAB:
 	    break;
@@ -172,7 +197,8 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
 	    case HSO_CLIENT_OP_LOCK:
             case HSO_CLIENT_OP_LOCK_WAIT_BEGIN:
             case HSO_CLIENT_OP_LOCK_WAIT_END:
-		return STATUS_FILE_CORRUPT_ERROR;
+		ret = STATUS_FILE_CORRUPT_ERROR;
+                goto maybe_done;
 
 	    case HSO_CLIENT_OP_RELEASE_DELIST:
 	    case HSO_CLIENT_OP_RELEASE:
@@ -189,7 +215,8 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
             case HSO_CLIENT_OP_LOCK:
             case HSO_CLIENT_OP_LIST:
             case HSO_CLIENT_OP_LOCK_WAIT_END:
-		return STATUS_WAS_LOCKED;
+		ret = STATUS_WAS_LOCKED;
+                goto maybe_done;
 
 	    case HSO_CLIENT_OP_UNLOCK:
 	    case HSO_CLIENT_OP_RELEASE:
@@ -197,9 +224,12 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
             case HSO_CLIENT_OP_LOCK_WAIT_BEGIN:
 		break;
 	    }
-        } else if (op == HSO_CLIENT_OP_LOCK_WAIT_BEGIN)
-            return STATUS_NOT_LOCKED;
-        _new.value = pre->value;
+        }
+        else if (op == HSO_CLIENT_OP_LOCK_WAIT_BEGIN)
+        {
+            ret = STATUS_NOT_LOCKED;
+            goto maybe_done;
+        }
 
 	/* TODO: x86 does not read __int64 atomically, should we redirect any failure on x86 to
          * repeat after an interlocked read?  */
@@ -210,7 +240,10 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
 
 	case HSO_CLIENT_OP_GRAB:
 	    if (unlikely(refcount == HYBRID_SYNC_REFCOUNT_MAX))
-		return STATUS_TOO_MANY_THREADS;
+            {
+		ret = STATUS_TOO_MANY_THREADS;
+                goto maybe_done;
+            }
 
             ++refcount;
 	    break;
@@ -228,7 +261,9 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
 
 	case HSO_CLIENT_OP_UNLOCK:
 	    flags &= ~HYBRID_SYNC_LOCKED;
-	    //_new.value = new_value;
+            /* Although this operation can fail, it never should outside of (private) memory
+             * corruption, therefore if we modify the value pointer and the operation fails, the
+             * object is already bad anyway. */
             ho->atomic.value = new_value;
 	    break;
 
@@ -246,15 +281,25 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
             assert (0);
 	};
 
-        _new.flags_refcounts = hso_atomic_make_flags_refcounts( flags, refcount, waiters );
+        if (0)
+        {
+maybe_done:
+            if (!maybe_stale)
+                return ret;
+            _new = pre->flags_refcounts;
+        }
+        else
+            _new = hso_atomic_make_flags_refcounts( flags, refcount, waiters );
         old = pre->flags_refcounts;
         pre->flags_refcounts = interlocked_cmpxchg_long( (long*)&ho->atomic.flags_refcounts,
-                                                         _new.flags_refcounts,
-                                                         pre->flags_refcounts );
+                                                         _new, pre->flags_refcounts );
+        maybe_stale = FALSE;
     } while (unlikely( pre->flags_refcounts != old ));
 
     if (ret_value)
-	*ret_value = _new.value;
+        /* ho->atomic.value will always be in the same cache line as ho->atomic.flags_refcounts,
+         * so will always be correct here.  */
+	*ret_value = ho->atomic.value;
 
 
     /* if refcount is zero and both HYBRID_SYNC_ACCESSIBLE and HYBRID_SYNC_LOCKED bits are cleared
@@ -289,14 +334,14 @@ hso_client_op( struct hybrid_sync_object *ho, union hso_atomic *pre, enum hso_cl
  *
  */
 
-static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_grab(struct hybrid_sync_object *ho)
+static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_grab( struct hybrid_sync_object *ho )
 {
     NTSTATUS result;
     union hso_atomic pre = ho->atomic;
 
     for (;;)
     {
-	result = hso_client_op( ho, &pre, HSO_CLIENT_OP_GRAB, NULL, NULL );
+	result = hso_client_op( ho, &pre, TRUE, HSO_CLIENT_OP_GRAB, NULL, NULL );
 
 	if (result != STATUS_WAS_LOCKED)
 	    return result;
@@ -315,15 +360,16 @@ static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_grab(struct hybrid_sync_object
  *
  * fast path built with gcc on x86_64 is 61 bytes
  */
-static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_release( struct hybrid_sync_object *ho, int delist,
-                                                    unsigned *refs )
+static DECLSPEC_MUST_CHECK NTSTATUS
+hybrid_object_release( struct hybrid_sync_object *ho, int delist, unsigned *refs )
 {
     union hso_atomic pre = ho->atomic;
     unsigned refcount;
     unsigned waiters;
     NTSTATUS result;
+    enum hso_client_op_enum op = delist ? HSO_CLIENT_OP_RELEASE_DELIST : HSO_CLIENT_OP_RELEASE;
 
-    result = hso_client_op( ho, &pre, delist ? HSO_CLIENT_OP_RELEASE_DELIST : HSO_CLIENT_OP_RELEASE, NULL, NULL );
+    result = hso_client_op( ho, &pre, TRUE, op, NULL, NULL );
     refcount = hso_atomic_get_refcount( &pre );
     waiters = hso_atomic_get_waitcount( &pre );
     /* There should always be at least one reference and we should never call this function while
@@ -356,24 +402,24 @@ static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_do_move( struct hybrid_sync_ob
     struct shm_object_info info;
     union shm_sync_value *orig;
 
-    result = hso_client_op( ho, pre, HSO_CLIENT_OP_LOCK, NULL, NULL );
+    result = hso_client_op( ho, pre, TRUE, HSO_CLIENT_OP_LOCK, NULL, NULL );
 
     /* if already locked, then another thread is doing it, wait */
     if (result == STATUS_WAS_LOCKED)
     {
         //putc('L', stderr);
-	result = hso_client_op( ho, pre, HSO_CLIENT_OP_LOCK_WAIT_BEGIN, NULL, NULL );
+	result = hso_client_op( ho, pre, FALSE, HSO_CLIENT_OP_LOCK_WAIT_BEGIN, NULL, NULL );
         if (result == STATUS_NOT_LOCKED)
 	    return STATUS_SUCCESS;
         else if (result)
             return result;
 
         orig = pre->value;
-        hso_client_futex_wake( &ho->atomic);
+        hso_client_futex_wake( &ho->atomic );
 
         do {
             hybrid_object_do_move_wait( ho, pre );
-            result = hso_client_op( ho, pre, HSO_CLIENT_OP_LOCK_WAIT_END, NULL, NULL );
+            result = hso_client_op( ho, pre, TRUE, HSO_CLIENT_OP_LOCK_WAIT_END, NULL, NULL );
         } while (result == STATUS_WAS_LOCKED);
 
         return result;
@@ -457,7 +503,7 @@ static DECLSPEC_MUST_CHECK NTSTATUS hybrid_object_do_move( struct hybrid_sync_ob
     ho->hash_base = fnv1a_hash32( FNV1A_32_INIT, info.hash_base_in, sizeof (info.hash_base_in) );
     orig = pre->value;
 
-    result = hso_client_op( ho, pre, HSO_CLIENT_OP_UNLOCK, NULL, info.ptr );
+    result = hso_client_op( ho, pre, TRUE, HSO_CLIENT_OP_UNLOCK, NULL, info.ptr );
     /* If the server returned the same shared memory, then some error has led us to here. */
     assert( orig != ho->atomic.value );
     assert( !result );
