@@ -665,11 +665,14 @@ release_object:
         }
 
         for (j = i; j;)
+        {
+            struct ntdll_object *obj = objs[--j];
             /* Check for both a duplicate handle and two handles to the same shared object via
-            * the value pointer, as we should never have the same memory mapped in two
-            * different places. */
-            if (objs[--j]->any.ho.atomic.value == objs[i]->any.ho.atomic.value)
+             * the value pointer, as we should never have the same memory mapped in two
+             * different places. */
+            if (obj && obj->any.ho.atomic.value == objs[i]->any.ho.atomic.value)
                 goto release_object;
+        }
 
         /* Object is shared and unique (or the first one) in the list. */
         shared_objects |= mask;
